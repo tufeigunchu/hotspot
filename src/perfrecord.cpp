@@ -44,6 +44,10 @@
 
 #include <hotspot-config.h>
 
+#if KF5Auth_FOUND
+#include <KAuth>
+#endif
+
 PerfRecord::PerfRecord(QObject* parent)
     : QObject(parent)
     , m_perfRecordProcess(nullptr)
@@ -82,7 +86,7 @@ void PerfRecord::startRecording(bool elevatePrivileges, const QStringList& perfO
 {
     if (elevatePrivileges) {
         // elevate privileges temporarily as root
-        // use kdesudo/kdesu to start the elevate_perf_privileges.sh script
+        // use kauth/kdesudo to start the elevate_perf_privileges.sh script
         // then parse its output and once we get the "waiting..." line the privileges got elevated
         // in that case, we can continue to start perf and quit the elevate_perf_privileges.sh script
         // once perf has started
@@ -162,7 +166,39 @@ void PerfRecord::startRecording(bool elevatePrivileges, const QStringList& perfO
                     }
                 });
 
+#if KF5Auth_FOUND
+        KAuth::Action action(QStringLiteral("com.kdab.hotspot.perf.elevate"));
+        action.setHelperId(QStringLiteral("com.kdab.hotspot.perf"));
+        QVariantMap args;
+        args[QStringLiteral("output")] = outputFile->fileName();
+        action.setArguments(args);
+
+        auto job = action.execute();
+
+        connect(job, &KAuth::ExecuteJob::result, this, [this, sudoBinary, options, readTimer](KJob* kjob) {
+            auto* job = qobject_cast<KAuth::ExecuteJob*>(kjob);
+
+            if (job->error() == KAuth::ActionReply::NoError) {
+                readTimer->start(250);
+            } else if (job->error() == KAuth::ActionReply::DBusError
+                       || job->error() == KAuth::ActionReply::InvalidActionError) {
+                // could not start the helper, maybe the helper is not installed
+                // fall back to kdesu
+                m_elevatePrivilegesProcess->start(sudoBinary, options);
+            } else {
+                const auto errorMessage = job->errorString();
+                if (errorMessage.isEmpty()) {
+                    emit recordingFailed(tr("Failed to elevate privileges."));
+                } else {
+                    emit recordingFailed(tr("Failed to elevate privileges: %1").arg(errorMessage));
+                }
+            }
+        });
+
+        job->start();
+#else
         m_elevatePrivilegesProcess->start(sudoBinary, options);
+#endif
     } else {
         startRecording(perfOptions, outputPath, recordOptions, workingDirectory);
     }
