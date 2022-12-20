@@ -1,0 +1,23 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: tufeigunchu/dev
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: configure
+      run: sudo tar xf /host.txz -C /run/media/pqy/sda1/br/kf5-89/
+    - name: make
+      run: sudo ln -s /run/media/pqy/sda1/br/kf5-89/host/x86_64-buildroot-linux-musl/sysroot /run/media/pqy/sda1/br/kf5-89/staging
+    - name: make check
+      run: git clone https://gitee.com/pangqingyuan/hotspot.git -b pqy
+    - name: make distcheck
+      run: /run/media/pqy/sda1/br/kf5-89/host/bin/qmake hotspot && make -2
