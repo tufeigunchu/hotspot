@@ -1,28 +1,9 @@
 /*
-  recordpage.h
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
@@ -31,8 +12,10 @@
 #include <QFutureWatcher>
 #include <QWidget>
 
-#include "multiconfigwidget.h"
 #include "processlist.h"
+#include "recordhost.h"
+
+#include <memory>
 
 class QTimer;
 class QTemporaryFile;
@@ -44,19 +27,12 @@ class RecordPage;
 class PerfRecord;
 class ProcessModel;
 class ProcessFilterModel;
+class MultiConfigWidget;
+class PerfOutputWidget;
 
 namespace KParts {
 class ReadOnlyPart;
 }
-
-enum RecordType
-{
-    LaunchApplication = 0,
-    AttachToProcess,
-    ProfileSystem,
-    NUM_RECORD_TYPES
-};
-Q_DECLARE_METATYPE(RecordType)
 
 class RecordPage : public QWidget
 {
@@ -72,28 +48,19 @@ signals:
     void homeButtonClicked();
     void openFile(QString filePath);
 
-private slots:
-    void onApplicationNameChanged(const QString& filePath);
+private:
     void onStartRecordingButtonClicked(bool checked);
-    void onWorkingDirectoryNameChanged(const QString& folderPath);
-    void onViewPerfRecordResultsButtonClicked();
-    void onOutputFileNameChanged(const QString& filePath);
-    void onOutputFileUrlChanged(const QUrl& fileUrl);
-    void onOutputFileNameSelected(const QString& filePath);
-    void updateOffCpuCheckboxState();
-
     void updateProcesses();
     void updateProcessesFinished();
 
-private:
     void recordingStopped();
     void updateRecordType();
     void appendOutput(const QString& text);
     void setError(const QString& message);
-    void addKonsoleWidget();
 
-    QScopedPointer<Ui::RecordPage> ui;
+    std::unique_ptr<Ui::RecordPage> ui;
 
+    RecordHost* m_recordHost;
     PerfRecord* m_perfRecord;
     QString m_resultsFile;
     QElapsedTimer m_recordTimer;
@@ -101,6 +68,7 @@ private:
     KParts::ReadOnlyPart* m_konsolePart = nullptr;
     QTemporaryFile* m_konsoleFile = nullptr;
     MultiConfigWidget* m_multiConfig;
+    PerfOutputWidget* m_perfOutput;
 
     ProcessModel* m_processModel;
     ProcessFilterModel* m_processProxyModel;

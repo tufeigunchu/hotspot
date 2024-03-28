@@ -1,28 +1,9 @@
 /*
-  startpage.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "startpage.h"
@@ -32,9 +13,11 @@
 #include <QMainWindow>
 #include <QPainter>
 
+#include <KFormat>
+
 StartPage::StartPage(QWidget* parent)
     : QWidget(parent)
-    , ui(new Ui::StartPage)
+    , ui(std::make_unique<Ui::StartPage>())
 {
     ui->setupUi(this);
 
@@ -74,11 +57,40 @@ void StartPage::onOpenFileError(const QString& errorMessage)
 
 void StartPage::onParseFileProgress(float percent)
 {
+    ui->loadStack->setCurrentWidget(ui->parseProgressPage);
+
     const int scale = 1000;
-    if (!ui->openFileProgressBar->maximum()) {
+    if (ui->openFileProgressBar->maximum() == 0) {
         ui->openFileProgressBar->setMaximum(scale);
     }
     ui->openFileProgressBar->setValue(static_cast<int>(percent * scale));
+}
+
+void StartPage::onDebugInfoDownloadProgress(const QString& module, const QString& url, qint64 numerator,
+                                            qint64 denominator)
+{
+    if (numerator == denominator) {
+        ui->loadStack->setCurrentWidget(ui->parseProgressPage);
+        return;
+    }
+
+    const auto format = KFormat();
+    ui->loadStack->setCurrentWidget(ui->downloadDebugInfoProgressPage);
+
+    ui->downloadDebugInfoProgressLabel->setText(
+        tr("Downloading Debug Information for %1 (%2 of %3)")
+            .arg(module, format.formatByteSize(numerator, 1, KFormat::MetricBinaryDialect),
+                 denominator == 0 ? QStringLiteral("?")
+                                  : format.formatByteSize(denominator, 1, KFormat::MetricBinaryDialect)));
+    ui->downloadDebugInfoProgressLabel->setToolTip(url);
+
+    if (denominator == 0 || denominator > std::numeric_limits<int>::max()) {
+        ui->downloadDebugInfoProgressBar->setRange(0, 0);
+        ui->downloadDebugInfoProgressBar->setValue(-1);
+    } else {
+        ui->downloadDebugInfoProgressBar->setRange(0, static_cast<int>(denominator));
+        ui->downloadDebugInfoProgressBar->setValue(static_cast<int>(numerator));
+    }
 }
 
 void StartPage::paintEvent(QPaintEvent* /*event*/)

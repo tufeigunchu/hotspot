@@ -1,28 +1,9 @@
 /*
-  resultsutil.h
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
@@ -38,7 +19,6 @@ class QComboBox;
 class QLineEdit;
 class QSortFilterProxyModel;
 class QAbstractItemModel;
-class KLocalizedString;
 
 namespace Data {
 class Costs;
@@ -46,21 +26,23 @@ struct Symbol;
 }
 
 class FilterAndZoomStack;
+class CostContextMenu;
 
 namespace ResultsUtil {
-void setupHeaderView(QTreeView* view);
+void setupHeaderView(QTreeView* view, CostContextMenu* contextMenu);
 
 void connectFilter(QLineEdit* filter, QSortFilterProxyModel* proxy);
 
-void setupTreeView(QTreeView* view, QLineEdit* filter, QSortFilterProxyModel* model, int initialSortColumn,
-                   int sortRole);
+void setupTreeView(QTreeView* view, CostContextMenu* contextMenu, QLineEdit* filter, QSortFilterProxyModel* model,
+                   int initialSortColumn, int sortRole);
 
 template<typename Model>
-void setupTreeView(QTreeView* view, QLineEdit* filter, Model* model)
+void setupTreeView(QTreeView* view, CostContextMenu* costContextMenu, QLineEdit* filter, Model* model)
 {
     auto* proxy = new CostProxy<Model>(view);
     proxy->setSourceModel(model);
-    setupTreeView(view, filter, qobject_cast<QSortFilterProxyModel*>(proxy), Model::InitialSortColumn, Model::SortRole);
+    setupTreeView(view, costContextMenu, filter, qobject_cast<QSortFilterProxyModel*>(proxy), Model::InitialSortColumn,
+                  Model::SortRole);
 }
 
 void setupCostDelegate(QAbstractItemModel* model, QTreeView* view, int sortRole, int totalCostRole, int numBaseColumns);
@@ -82,15 +64,17 @@ enum class CallbackAction
 };
 Q_DECLARE_FLAGS(CallbackActions, CallbackAction)
 
-void setupContextMenu(QTreeView* view, int symbolRole, FilterAndZoomStack* filterStack, CallbackActions actions,
-                      std::function<void(CallbackAction action, const Data::Symbol&)> callback);
+void setupContextMenu(QTreeView* view, CostContextMenu* costContextMenu, int symbolRole,
+                      FilterAndZoomStack* filterStack, CallbackActions actions,
+                      const std::function<void(CallbackAction action, const Data::Symbol&)>& callback);
 
 template<typename Model, typename Context>
-void setupContextMenu(QTreeView* view, Model* /*model*/, FilterAndZoomStack* filterStack, Context* context,
+void setupContextMenu(QTreeView* view, CostContextMenu* costContextMenu, Model* /*model*/,
+                      FilterAndZoomStack* filterStack, Context* context,
                       CallbackActions actions = {CallbackAction::ViewCallerCallee, CallbackAction::OpenEditor,
                                                  CallbackAction::SelectSymbol, CallbackAction::ViewDisassembly})
 {
-    setupContextMenu(view, Model::SymbolRole, filterStack, actions,
+    setupContextMenu(view, costContextMenu, Model::SymbolRole, filterStack, actions,
                      [context](ResultsUtil::CallbackAction action, const Data::Symbol& symbol) {
                          switch (action) {
                          case ResultsUtil::CallbackAction::ViewCallerCallee:
@@ -111,5 +95,9 @@ void setupContextMenu(QTreeView* view, Model* /*model*/, FilterAndZoomStack* fil
 
 void hideEmptyColumns(const Data::Costs& costs, QTreeView* view, int numBaseColumns);
 
-void fillEventSourceComboBox(QComboBox* combo, const Data::Costs& costs, const KLocalizedString& tooltipTemplate);
+void hideTracepointColumns(const Data::Costs& costs, QTreeView* view, int numBaseColumns);
+
+void fillEventSourceComboBox(QComboBox* combo, const Data::Costs& costs, const QString& tooltipTemplate);
+
+void setupResultsAggregation(QComboBox* costAggregationComboBox);
 }

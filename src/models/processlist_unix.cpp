@@ -47,13 +47,14 @@ QDebug operator<<(QDebug d, const ProcData& data)
     return d;
 }
 
-static bool isUnixProcessId(const QString& procname)
+namespace {
+bool isUnixProcessId(const QString& procname)
 {
     return std::all_of(procname.begin(), procname.end(), [](QChar c) { return c.isDigit(); });
 }
 
 // Determine UNIX processes by running ps
-static ProcDataList unixProcessListPS()
+ProcDataList unixProcessListPS()
 {
 #ifdef Q_OS_MAC
     // command goes last, otherwise it is cut off
@@ -67,7 +68,7 @@ static ProcDataList unixProcessListPS()
         return {};
 
     psProcess.waitForFinished();
-    QByteArray output = psProcess.readAllStandardOutput();
+    const auto output = psProcess.readAllStandardOutput();
     // Split "457 S+   /Users/foo.app"
     const QStringList lines = QString::fromLocal8Bit(output).split(QLatin1Char('\n'));
     const int lineCount = lines.size();
@@ -91,6 +92,7 @@ static ProcDataList unixProcessListPS()
     }
 
     return rc;
+}
 }
 
 // Determine UNIX processes by reading "/proc". Default to ps if

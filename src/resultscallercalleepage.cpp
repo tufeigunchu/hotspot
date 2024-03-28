@@ -1,28 +1,9 @@
 /*
-  resultscallercalleepage.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "resultscallercalleepage.h"
@@ -34,25 +15,47 @@
 #include <QMenu>
 #include <QSortFilterProxyModel>
 
+#include "costcontextmenu.h"
 #include "parsers/perf/perfparser.h"
 #include "resultsutil.h"
 
 #include "models/callercalleemodel.h"
-#include "models/costdelegate.h"
+#include "models/callercalleeproxy.h"
+#include "models/disassemblyoutput.h"
 #include "models/filterandzoomstack.h"
 #include "models/hashmodel.h"
 #include "models/treemodel.h"
 
+#include <QPushButton>
+#include <QTemporaryFile>
+
+#include "hotspot-config.h"
+
+#if KGraphViewerPart_FOUND
+#include "callgraphwidget.h"
+#endif
+
 namespace {
+QSortFilterProxyModel* createProxy(SourceMapModel* model)
+{
+    return new SourceMapProxy(model);
+}
+
 template<typename Model>
-Model* setupModelAndProxyForView(QTreeView* view)
+QSortFilterProxyModel* createProxy(Model* model)
+{
+    return new CallerCalleeProxy<Model>(model);
+}
+
+template<typename Model>
+Model* setupModelAndProxyForView(QTreeView* view, CostContextMenu* contextMenu)
 {
     auto model = new Model(view);
-    auto proxy = new QSortFilterProxyModel(model);
+    auto proxy = createProxy(model);
     proxy->setSourceModel(model);
     proxy->setSortRole(Model::SortRole);
     view->setModel(proxy);
-    ResultsUtil::setupHeaderView(view);
+    ResultsUtil::setupHeaderView(view, contextMenu);
     ResultsUtil::setupCostDelegate(model, view);
     view->sortByColumn(Model::InitialSortColumn, Qt::DescendingOrder);
 
@@ -70,42 +73,58 @@ void connectCallerOrCalleeModel(QTreeView* view, CallerCalleeModel* callerCallee
 }
 }
 
-ResultsCallerCalleePage::ResultsCallerCalleePage(FilterAndZoomStack* filterStack, PerfParser* parser, QWidget* parent)
+ResultsCallerCalleePage::ResultsCallerCalleePage(FilterAndZoomStack* filterStack, PerfParser* parser,
+                                                 CostContextMenu* contextMenu, QWidget* parent)
     : QWidget(parent)
-    , ui(new Ui::ResultsCallerCalleePage)
+    , ui(std::make_unique<Ui::ResultsCallerCalleePage>())
 {
     ui->setupUi(this);
 
     m_callerCalleeCostModel = new CallerCalleeModel(this);
-    m_callerCalleeProxy = new QSortFilterProxyModel(this);
+    m_callerCalleeProxy = new CallerCalleeProxy<CallerCalleeModel>(this);
     m_callerCalleeProxy->setSourceModel(m_callerCalleeCostModel);
     m_callerCalleeProxy->setSortRole(CallerCalleeModel::SortRole);
     ResultsUtil::connectFilter(ui->callerCalleeFilter, m_callerCalleeProxy);
     ui->callerCalleeTableView->setSortingEnabled(true);
     ui->callerCalleeTableView->setModel(m_callerCalleeProxy);
-    ResultsUtil::setupContextMenu(ui->callerCalleeTableView, m_callerCalleeCostModel, filterStack, this,
+    ResultsUtil::setupContextMenu(ui->callerCalleeTableView, contextMenu, m_callerCalleeCostModel, filterStack, this,
                                   {ResultsUtil::CallbackAction::OpenEditor, ResultsUtil::CallbackAction::SelectSymbol,
                                    ResultsUtil::CallbackAction::ViewDisassembly});
-    ResultsUtil::setupHeaderView(ui->callerCalleeTableView);
+    ResultsUtil::setupHeaderView(ui->callerCalleeTableView, contextMenu);
     ResultsUtil::setupCostDelegate(m_callerCalleeCostModel, ui->callerCalleeTableView);
 
     connect(parser, &PerfParser::callerCalleeDataAvailable, this, [this](const Data::CallerCalleeResults& data) {
         m_callerCalleeCostModel->setResults(data);
         ResultsUtil::hideEmptyColumns(data.inclusiveCosts, ui->callerCalleeTableView,
                                       CallerCalleeModel::NUM_BASE_COLUMNS);
+
         ResultsUtil::hideEmptyColumns(data.selfCosts, ui->callerCalleeTableView,
                                       CallerCalleeModel::NUM_BASE_COLUMNS + data.inclusiveCosts.numTypes());
+        ResultsUtil::hideTracepointColumns(data.selfCosts, ui->callerCalleeTableView, BottomUpModel::NUM_BASE_COLUMNS);
         auto view = ui->callerCalleeTableView;
-        view->sortByColumn(CallerCalleeModel::InitialSortColumn, view->header()->sortIndicatorOrder());
         view->setCurrentIndex(view->model()->index(0, 0, {}));
         ResultsUtil::hideEmptyColumns(data.inclusiveCosts, ui->callersView, CallerModel::NUM_BASE_COLUMNS);
         ResultsUtil::hideEmptyColumns(data.inclusiveCosts, ui->calleesView, CalleeModel::NUM_BASE_COLUMNS);
         ResultsUtil::hideEmptyColumns(data.inclusiveCosts, ui->sourceMapView, SourceMapModel::NUM_BASE_COLUMNS);
+        ResultsUtil::hideTracepointColumns(data.selfCosts, ui->sourceMapView, SourceMapModel::NUM_BASE_COLUMNS);
+
+#if KGraphViewerPart_FOUND
+        if (m_callgraph) {
+            m_callgraph->setResults(data);
+        }
+#endif
     });
 
-    auto calleesModel = setupModelAndProxyForView<CalleeModel>(ui->calleesView);
-    auto callersModel = setupModelAndProxyForView<CallerModel>(ui->callersView);
-    auto sourceMapModel = setupModelAndProxyForView<SourceMapModel>(ui->sourceMapView);
+#if KGraphViewerPart_FOUND
+    m_callgraph = CallgraphWidget::createCallgraphWidget({}, this);
+    if (m_callgraph) {
+        ui->splitter_2->addWidget(m_callgraph);
+    }
+#endif
+
+    auto calleesModel = setupModelAndProxyForView<CalleeModel>(ui->calleesView, contextMenu);
+    auto callersModel = setupModelAndProxyForView<CallerModel>(ui->callersView, contextMenu);
+    auto sourceMapModel = setupModelAndProxyForView<SourceMapModel>(ui->sourceMapView, contextMenu);
 
     auto selectCallerCaleeeIndex = [calleesModel, callersModel, sourceMapModel, this](const QModelIndex& index) {
         const auto costs = index.data(CallerCalleeModel::SelfCostsRole).value<Data::Costs>();
@@ -118,20 +137,34 @@ ResultsCallerCalleePage::ResultsCallerCalleePage(FilterAndZoomStack* filterStack
         if (index.model() == m_callerCalleeCostModel) {
             ui->callerCalleeTableView->setCurrentIndex(m_callerCalleeProxy->mapFromSource(index));
         }
+#if KGraphViewerPart_FOUND
+        if (m_callgraph) {
+            m_callgraph->selectSymbol(index.data(CallerCalleeModel::SymbolRole).value<Data::Symbol>());
+        }
+#endif
     };
     connectCallerOrCalleeModel<CalleeModel>(ui->calleesView, m_callerCalleeCostModel, selectCallerCaleeeIndex);
     connectCallerOrCalleeModel<CallerModel>(ui->callersView, m_callerCalleeCostModel, selectCallerCaleeeIndex);
-    ResultsUtil::setupContextMenu(ui->calleesView, calleesModel, filterStack, this,
+    ResultsUtil::setupContextMenu(ui->calleesView, contextMenu, calleesModel, filterStack, this,
                                   {ResultsUtil::CallbackAction::OpenEditor, ResultsUtil::CallbackAction::SelectSymbol,
                                    ResultsUtil::CallbackAction::ViewDisassembly});
-    ResultsUtil::setupContextMenu(ui->callersView, callersModel, filterStack, this,
+    ResultsUtil::setupContextMenu(ui->callersView, contextMenu, callersModel, filterStack, this,
                                   {ResultsUtil::CallbackAction::OpenEditor, ResultsUtil::CallbackAction::SelectSymbol,
                                    ResultsUtil::CallbackAction::ViewDisassembly});
+
+#if KGraphViewerPart_FOUND
+    if (m_callgraph) {
+        connect(m_callgraph, &CallgraphWidget::clickedOn, this,
+                [this, selectCallerCaleeeIndex](const Data::Symbol& symbol) {
+                    const auto index = m_callerCalleeCostModel->indexForKey(symbol);
+                    selectCallerCaleeeIndex(index);
+                });
+    }
+#endif
 
     ui->sourceMapView->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(ui->sourceMapView, &QTreeView::customContextMenuRequested, this,
             &ResultsCallerCalleePage::onSourceMapContextMenu);
-    connect(ui->sourceMapView, &QTreeView::activated, this, &ResultsCallerCalleePage::onSourceMapActivated);
 
     connect(ui->callerCalleeTableView->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
             [selectCallerCaleeeIndex](const QModelIndex& current, const QModelIndex&) {
@@ -139,27 +172,25 @@ ResultsCallerCalleePage::ResultsCallerCalleePage(FilterAndZoomStack* filterStack
                     selectCallerCaleeeIndex(current);
                 }
             });
+
+    ResultsUtil::setupResultsAggregation(ui->costAggregationComboBox);
 }
 
 ResultsCallerCalleePage::~ResultsCallerCalleePage() = default;
 
 ResultsCallerCalleePage::SourceMapLocation
-ResultsCallerCalleePage::toSourceMapLocation(const QString& location, const Data::Symbol& symbol) const
+ResultsCallerCalleePage::toSourceMapLocation(const Data::FileLine& fileLine, const Data::Symbol& symbol) const
 {
-    const auto separator = location.lastIndexOf(QLatin1Char(':'));
-    if (separator <= 0) {
+    if (!fileLine.isValid()) {
         return {};
     }
 
-    const auto fileName = location.leftRef(separator);
-    const auto lineNumber = location.midRef(separator + 1).toInt();
-
     SourceMapLocation ret;
-    auto resolvePath = [&ret, fileName, lineNumber](const QString& pathName) -> bool {
-        const QString path = pathName + fileName;
+    auto resolvePath = [&ret, &fileLine](const QString& pathName) -> bool {
+        const QString path = pathName + fileLine.file;
         if (QFileInfo::exists(path)) {
             ret.path = path;
-            ret.lineNumber = lineNumber;
+            ret.lineNumber = fileLine.line;
             return true;
         }
         return false;
@@ -177,42 +208,46 @@ ResultsCallerCalleePage::toSourceMapLocation(const QString& location, const Data
 
 ResultsCallerCalleePage::SourceMapLocation ResultsCallerCalleePage::toSourceMapLocation(const QModelIndex& index) const
 {
-    Q_ASSERT(qobject_cast<const SourceMapModel*>(index.model()));
-    const auto location = index.data(SourceMapModel::LocationRole).toString();
+    const auto fileLine = index.data(SourceMapModel::FileLineRole).value<Data::FileLine>();
     const auto symbol =
         ui->callerCalleeTableView->currentIndex().data(CallerCalleeModel::SymbolRole).value<Data::Symbol>();
-    return toSourceMapLocation(location, symbol);
+    return toSourceMapLocation(fileLine, symbol);
 }
 
-void ResultsCallerCalleePage::onSourceMapContextMenu(const QPoint& point)
+void ResultsCallerCalleePage::onSourceMapContextMenu(QPoint point)
 {
-    const auto index = ui->sourceMapView->indexAt(point);
-    if (!index.isValid()) {
+    const auto sourceMapIndex = ui->sourceMapView->indexAt(point);
+    if (!sourceMapIndex.isValid()) {
         return;
     }
 
-    const auto location = toSourceMapLocation(index);
+    const auto location = toSourceMapLocation(sourceMapIndex);
     if (!location) {
         return;
     }
 
     QMenu contextMenu;
     auto* viewCallerCallee = contextMenu.addAction(tr("Open in Editor"));
-    auto* action = contextMenu.exec(QCursor::pos());
-    if (action == viewCallerCallee) {
-        emit navigateToCode(location.path, location.lineNumber, 0);
-    }
-}
+    connect(viewCallerCallee, &QAction::triggered, this, [this, location, sourceMapIndex] {
+        if (location) {
+            emit navigateToCode(location.path, location.lineNumber, 0);
+        } else {
+            const auto fileLine = sourceMapIndex.data(SourceMapModel::FileLineRole).value<Data::FileLine>();
+            emit navigateToCodeFailed(tr("Failed to find file for location '%1'.").arg(fileLine.toString()));
+        }
+    });
 
-void ResultsCallerCalleePage::onSourceMapActivated(const QModelIndex& index)
-{
-    const auto location = toSourceMapLocation(index);
-    if (location) {
-        emit navigateToCode(location.path, location.lineNumber, 0);
-    } else {
-        const auto locationStr = index.data(SourceMapModel::LocationRole).toString();
-        emit navigateToCodeFailed(tr("Failed to find file for location '%1'.").arg(locationStr));
-    }
+    auto line = sourceMapIndex.data(SourceMapModel::FileLineRole).value<Data::FileLine>();
+    auto disassemblyAction = contextMenu.addAction(tr("Disassembly"));
+
+    // fetch current symbol from callerCalleeView to check if we can disassemble it
+    const auto symbol =
+        ui->callerCalleeTableView->currentIndex().data(CallerCalleeModel::SymbolRole).value<Data::Symbol>();
+    disassemblyAction->setEnabled(symbol.canDisassemble());
+    connect(disassemblyAction, &QAction::triggered, this,
+            [this, symbol, line] { emit jumpToSourceCode(symbol, line); });
+
+    contextMenu.exec(QCursor::pos());
 }
 
 void ResultsCallerCalleePage::setSysroot(const QString& path)
@@ -241,10 +276,14 @@ void ResultsCallerCalleePage::openEditor(const Data::Symbol& symbol)
     const auto callerCalleeIndex = m_callerCalleeProxy->mapFromSource(m_callerCalleeCostModel->indexForSymbol(symbol));
     const auto map = callerCalleeIndex.data(CallerCalleeModel::SourceMapRole).value<Data::SourceLocationCostMap>();
 
-    auto it = std::find_if(map.keyBegin(), map.keyEnd(), [&symbol, this](const QString& locationStr) {
-        const auto location = toSourceMapLocation(locationStr, symbol);
+    auto it = std::find_if(map.keyBegin(), map.keyEnd(), [&symbol, this](const Data::FileLine& fileLine) {
+        const auto location = toSourceMapLocation(fileLine, symbol);
         if (location) {
-            emit navigateToCode(location.path, location.lineNumber, 0);
+            auto settings = Settings::instance();
+            const auto colon = QLatin1Char(':');
+            auto remappedSourceFile =
+                findSourceCodeFile(location.path, settings->sourceCodePaths().split(colon), settings->sysroot());
+            emit navigateToCode(remappedSourceFile, location.lineNumber, 0);
             return true;
         }
         return false;

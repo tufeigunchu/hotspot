@@ -1,28 +1,8 @@
 /*
-  perfparser.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "perfparser.h"
@@ -30,11 +10,14 @@
 #include <QBuffer>
 #include <QDataStream>
 #include <QDebug>
+#include <QDir>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QLoggingCategory>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QTemporaryFile>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QtEndian>
@@ -47,6 +30,12 @@
 #include <util.h>
 
 #include <functional>
+
+#include "settings.h"
+
+#if KFArchive_FOUND
+#include <KCompressionDevice>
+#endif
 
 Q_LOGGING_CATEGORY(LOG_PERFPARSER, "hotspot.perfparser", QtWarningMsg)
 
@@ -85,7 +74,7 @@ QDataStream& operator>>(QDataStream& stream, StringId& stringId)
     return stream >> stringId.id;
 }
 
-QDebug operator<<(QDebug stream, const StringId& stringId)
+QDebug operator<<(QDebug stream, StringId stringId)
 {
     stream.noquote().nospace() << "String{"
                                << "id=" << stringId.id << "}";
@@ -94,6 +83,16 @@ QDebug operator<<(QDebug stream, const StringId& stringId)
 
 struct AttributesDefinition
 {
+    // see perfattributes.h
+    enum class Type : quint32
+    {
+        Hardware = 0,
+        Software = 1,
+        Tracepoint = 2,
+        HardwareCache = 3,
+        Raw = 4,
+        Breakpoint = 5,
+    };
     qint32 id = 0;
     quint32 type = 0;
     quint64 config = 0;
@@ -229,12 +228,13 @@ struct Symbol
     StringId path;
     StringId actualPath;
     bool isKernel = false;
+    bool isInline = false;
 };
 
 QDataStream& operator>>(QDataStream& stream, Symbol& symbol)
 {
     return stream >> symbol.name >> symbol.binary >> symbol.path >> symbol.isKernel >> symbol.relAddr >> symbol.size
-        >> symbol.actualPath;
+        >> symbol.actualPath >> symbol.isInline;
 }
 
 QDebug operator<<(QDebug stream, const Symbol& symbol)
@@ -246,7 +246,8 @@ QDebug operator<<(QDebug stream, const Symbol& symbol)
                                << "binary=" << symbol.binary << ", "
                                << "path=" << symbol.path << ", "
                                << "actualPath=" << symbol.actualPath << ", "
-                               << "isKernel=" << symbol.isKernel << "}";
+                               << "isKernel=" << symbol.isKernel << ", "
+                               << "isInline=" << symbol.isInline << "}";
     return stream;
 }
 
@@ -280,7 +281,7 @@ QDataStream& operator>>(QDataStream& stream, SampleCost& sampleCost)
     return stream >> sampleCost.attributeId >> sampleCost.cost;
 }
 
-QDebug operator<<(QDebug stream, const SampleCost& sampleCost)
+QDebug operator<<(QDebug stream, SampleCost sampleCost)
 {
     stream.noquote().nospace() << "SampleCost{"
                                << "attributeId=" << sampleCost.attributeId << ", "
@@ -540,17 +541,44 @@ void addCallerCalleeEvent(const Data::Symbol& symbol, const Data::Location& loca
     auto recursionIt = recursionGuard->find(symbol);
     if (recursionIt == recursionGuard->end()) {
         auto& entry = callerCalleeResult->entry(symbol);
-        auto& sourceCost = entry.source(location.location, numCosts);
-        auto& locationCost = entry.offset(location.relAddr, numCosts);
+        auto& sourceCost = entry.source(location.fileLine, numCosts);
+        // relAddr can be 0 for symbols in the main executable
+        auto& addrCost = entry.offset(location.relAddr ? location.relAddr : location.address, numCosts);
 
         sourceCost.inclusiveCost[type] += cost;
-        locationCost.inclusiveCost[type] += cost;
+        addrCost.inclusiveCost[type] += cost;
         if (recursionGuard->isEmpty()) {
             // increment self cost for leaf
             sourceCost.selfCost[type] += cost;
-            locationCost.selfCost[type] += cost;
+            addrCost.selfCost[type] += cost;
         }
         recursionGuard->insert(symbol);
+    }
+}
+
+template<typename FrameCallback>
+void addBottomUpResult(Data::BottomUpResults* bottomUpResult, Settings::CostAggregation costAggregation,
+                       const Data::ThreadNames& commands, int type, quint64 cost, qint32 pid, qint32 tid, quint32 cpu,
+                       const QVector<qint32>& frames, const FrameCallback& frameCallback)
+{
+    switch (costAggregation) {
+    case Settings::CostAggregation::BySymbol:
+        bottomUpResult->addEvent(type, cost, frames, frameCallback);
+        break;
+    case Settings::CostAggregation::ByThread: {
+        auto thread = commands.names.value(pid).value(tid);
+        bottomUpResult->addEvent(thread.isEmpty() ? QString::number(tid) : thread, type, cost, frames, frameCallback);
+        break;
+    }
+    case Settings::CostAggregation::ByProcess: {
+        auto process = commands.names.value(pid).value(pid);
+        bottomUpResult->addEvent(process.isEmpty() ? QString::number(pid) : process, type, cost, frames, frameCallback);
+        break;
+    }
+    case Settings::CostAggregation::ByCPU:
+        bottomUpResult->addEvent({QLatin1String("CPU %1").arg(QString::number(cpu))}, type, cost, frames,
+                                 frameCallback);
+        break;
     }
 }
 
@@ -559,6 +587,20 @@ struct SymbolCount
     qint32 total = 0;
     qint32 missing = 0;
 };
+
+QProcessEnvironment perfparserEnvironment(const QStringList& debuginfodUrls)
+{
+    auto env = Util::appImageEnvironment();
+
+    if (!debuginfodUrls.isEmpty()) {
+        const auto envVar = QStringLiteral("DEBUGINFOD_URLS");
+        const auto defaultUrls = env.value(envVar);
+        const auto separator = QLatin1Char(' ');
+        env.insert(envVar, debuginfodUrls.join(separator) + separator + defaultUrls);
+    }
+
+    return env;
+}
 }
 
 Q_DECLARE_TYPEINFO(AttributesDefinition, Q_MOVABLE_TYPE);
@@ -568,16 +610,18 @@ class PerfParserPrivate : public QObject
 {
     Q_OBJECT
 public:
-    explicit PerfParserPrivate(QObject* parent = nullptr)
+    explicit PerfParserPrivate(Settings::CostAggregation costAggregation = Settings::CostAggregation::BySymbol,
+                               QObject* parent = nullptr)
         : QObject(parent)
         , stopRequested(false)
+        , costAggregation(costAggregation)
     {
         buffer.buffer().reserve(1024);
         buffer.open(QIODevice::ReadOnly);
         stream.setDevice(&buffer);
 
         if (qEnvironmentVariableIntValue("HOTSPOT_GENERATE_SCRIPT_OUTPUT")) {
-            perfScriptOutput.reset(new QTextStream(stdout));
+            perfScriptOutput = std::make_unique<QTextStream>(stdout);
         }
     }
 
@@ -707,10 +751,13 @@ public:
             auto thread = addThread(threadStart);
             thread->time.start = threadStart.time;
             if (threadStart.ppid != threadStart.pid) {
-                const auto parentComm = commands.value(threadStart.ppid).value(threadStart.ppid);
-                commands[threadStart.pid][threadStart.pid] = parentComm;
+                const auto parentComm = commands.names.value(threadStart.ppid).value(threadStart.ppid);
+                commands.names[threadStart.pid][threadStart.pid] = parentComm;
                 thread->name = parentComm;
             }
+            // check if perf-$pid.map file exists
+            perfMapFileExists |= QFile::exists(QDir::tempPath() + QDir::separator()
+                                               + QLatin1String("perf-%1.map").arg(QString::number(thread->pid)));
             break;
         }
         case EventType::ThreadEnd: {
@@ -794,6 +841,16 @@ public:
             emit progress(percent);
             break;
         }
+        case EventType::DebugInfoDownloadProgress: {
+            StringId module;
+            StringId url;
+            qint64 numerator = 0;
+            qint64 denominator = 0;
+            stream >> module >> url >> numerator >> denominator;
+            qCDebug(LOG_PERFPARSER) << "parsed:" << url << numerator << denominator;
+            emit debugInfoDownloadProgress(strings.value(module.id), strings.value(url.id), numerator, denominator);
+            break;
+        }
         case EventType::TracePointFormat:
             // TODO: implement me
             return true;
@@ -814,11 +871,12 @@ public:
     {
         Data::BottomUp::initializeParents(&bottomUpResult.root);
 
-        summaryResult.applicationRunningTime = applicationTime.delta();
+        summaryResult.applicationTime = applicationTime;
         summaryResult.threadCount = uniqueThreads.size();
         summaryResult.processCount = uniqueProcess.size();
 
         buildTopDownResult();
+        buildPerLibraryResult();
         buildCallerCalleeResult();
 
         for (auto& thread : eventResult.threads) {
@@ -886,7 +944,12 @@ public:
 
         if (costId == -1) {
             const auto label = strings.value(attributesDefinition.name.id);
-            costId = addCostType(label, Data::Costs::Unit::Unknown);
+            auto unit = [&] {
+                if (attributesDefinition.type == static_cast<quint32>(AttributesDefinition::Type::Tracepoint))
+                    return Data::Costs::Unit::Tracepoint;
+                return Data::Costs::Unit::Unknown;
+            }();
+            costId = addCostType(label, unit);
             attributeNameToCostIds.insert(attributesDefinition.name.id, costId);
         }
 
@@ -904,9 +967,9 @@ public:
         // we started the application, otherwise we override the start time when
         // we encounter a ThreadStart event
         thread.time.start = applicationTime.start;
-        thread.name = commands.value(thread.pid).value(thread.tid);
+        thread.name = commands.names.value(thread.pid).value(thread.tid);
         if (thread.name.isEmpty() && thread.pid != thread.tid)
-            thread.name = commands.value(thread.pid).value(thread.pid);
+            thread.name = commands.names.value(thread.pid).value(thread.pid);
         eventResult.threads.push_back(thread);
         return &eventResult.threads.last();
     }
@@ -928,22 +991,20 @@ public:
             thread->name = comm;
         }
         // and remember the command, maybe a future ThreadStart event references it
-        commands[command.pid][command.tid] = comm;
+        commands.names[command.pid][command.tid] = comm;
     }
 
     void addLocation(const LocationDefinition& location)
     {
         Q_ASSERT(bottomUpResult.locations.size() == location.id);
         Q_ASSERT(bottomUpResult.symbols.size() == location.id);
-        QString locationString;
+        QString file;
         if (location.location.file.id != -1) {
-            locationString = strings.value(location.location.file.id);
-            if (location.location.line != -1) {
-                locationString += QLatin1Char(':') + QString::number(location.location.line);
-            }
+            file = strings.value(location.location.file.id);
         }
-        bottomUpResult.locations.push_back({location.location.parentLocationId,
-                                            {location.location.address, location.location.relAddr, locationString}});
+        bottomUpResult.locations.push_back(
+            {location.location.parentLocationId,
+             {location.location.address, location.location.relAddr, {file, location.location.line}}});
         bottomUpResult.symbols.push_back({});
     }
 
@@ -958,8 +1019,9 @@ public:
         const auto pathString = strings.value(symbol.symbol.path.id);
         const auto actualPathString = strings.value(symbol.symbol.actualPath.id);
         const auto isKernel = symbol.symbol.isKernel;
-        bottomUpResult.symbols[symbol.id] = {symbolString, relAddr,          size,    binaryString,
-                                             pathString,   actualPathString, isKernel};
+        const auto isInline = symbol.symbol.isInline;
+        bottomUpResult.symbols[symbol.id] = {symbolString, relAddr,          size,     binaryString,
+                                             pathString,   actualPathString, isKernel, isInline};
 
         // Count total and missing symbols per module for error report
         auto& numSymbols = numSymbolsByModule[symbol.symbol.binary.id];
@@ -980,8 +1042,41 @@ public:
         return id - 1;
     }
 
+    void addSampleToFrequencyData(const Sample& sample)
+    {
+        auto& lastTime = m_lastSampleTimePerCore[sample.cpu];
+        auto updateTime = qScopeGuard([&]() { lastTime = sample.time; });
+        if (!lastTime) {
+            return;
+        }
+
+        if (static_cast<quint32>(frequencyResult.cores.size()) <= sample.cpu) {
+            frequencyResult.cores.resize(sample.cpu + 1);
+        }
+
+        auto& core = frequencyResult.cores[sample.cpu];
+        for (const auto& cost : sample.costs) {
+            if (core.costs.size() <= cost.attributeId) {
+                const auto oldSize = core.costs.size();
+                const auto newSize = cost.attributeId + 1;
+                core.costs.resize(newSize);
+
+                for (int i = oldSize; i < newSize; i++) {
+                    core.costs[i].costName = strings.at(attributes[i].name.id);
+                }
+            }
+
+            auto& costs = core.costs[cost.attributeId];
+
+            auto frequency = static_cast<double>(cost.cost) / (sample.time - lastTime);
+            costs.values.push_back({sample.time, frequency});
+        }
+    }
+
     void addSample(const Sample& sample)
     {
+        addSampleToFrequencyData(sample);
+
         auto* thread = eventResult.findThread(sample.pid, sample.tid);
         if (!thread) {
             thread = addThread(sample);
@@ -1000,6 +1095,17 @@ public:
             event.cpuId = sample.cpu;
             thread->events.push_back(event);
             cpu.events.push_back(event);
+
+            const auto attribute = attributes.value(event.type);
+            if (attribute.type == static_cast<quint32>(AttributesDefinition::Type::Tracepoint)) {
+                Data::Tracepoint tracepoint;
+                tracepoint.time = event.time;
+                tracepoint.name = strings.value(attribute.name.id);
+                if (tracepoint.name != QLatin1String("sched:sched_switch")) {
+                    // sched_switch events are handled separately already
+                    tracepointResult.tracepoints.push_back(tracepoint);
+                }
+            }
         }
 
         addSampleToBottomUp(sample);
@@ -1024,10 +1130,10 @@ public:
         }
     }
 
-    void addSampleToBottomUp(const Sample& sample, const SampleCost& sampleCost)
+    void addSampleToBottomUp(const Sample& sample, SampleCost sampleCost)
     {
         if (perfScriptOutput) {
-            *perfScriptOutput << commands.value(sample.pid).value(sample.pid) << '\t' << sample.pid << '\t'
+            *perfScriptOutput << commands.names.value(sample.pid).value(sample.pid) << '\t' << sample.pid << '\t'
                               << sample.time / 1000000000 << '.' << qSetFieldWidth(9) << qSetPadChar(QLatin1Char('0'))
                               << sample.time % 1000000000 << qSetFieldWidth(0) << ":\t" << sampleCost.cost << ' '
                               << strings.value(attributes.value(sampleCost.attributeId).name.id) << '\n';
@@ -1048,13 +1154,14 @@ public:
                                  bottomUpResult.costs.numTypes());
 
             if (perfScriptOutput) {
-                *perfScriptOutput << '\t' << Qt::hex << qSetFieldWidth(16) << location.address << qSetFieldWidth(0) << Qt::dec
-                                  << ' ' << (symbol.symbol.isEmpty() ? QStringLiteral("[unknown]") : symbol.symbol)
-                                  << " (" << symbol.binary << ")\n";
+                *perfScriptOutput << '\t' << Qt::hex << qSetFieldWidth(16) << location.address << qSetFieldWidth(0)
+                                  << Qt::dec << ' '
+                                  << (symbol.symbol.isEmpty() ? QStringLiteral("[unknown]") : symbol.symbol) << " ("
+                                  << symbol.binary << ")\n";
             }
         };
 
-        bottomUpResult.addEvent(type, sampleCost.cost, sample.frames, frameCallback);
+        addBottomUpResult(type, sampleCost.cost, sample.pid, sample.tid, sample.cpu, sample.frames, frameCallback);
 
         if (perfScriptOutput) {
             *perfScriptOutput << "\n";
@@ -1063,7 +1170,13 @@ public:
 
     void buildTopDownResult()
     {
-        topDownResult = Data::TopDownResults::fromBottomUp(bottomUpResult);
+        topDownResult =
+            Data::TopDownResults::fromBottomUp(bottomUpResult, costAggregation != Settings::CostAggregation::BySymbol);
+    }
+
+    void buildPerLibraryResult()
+    {
+        perLibraryResult = Data::PerLibraryResults::fromTopDown(topDownResult);
     }
 
     void buildCallerCalleeResult()
@@ -1113,7 +1226,8 @@ public:
             thread->offCpuTime += switchTime;
 
             if (eventResult.offCpuTimeCostId == -1) {
-                eventResult.offCpuTimeCostId = addCostType(PerfParser::tr("off-CPU Time"), Data::Costs::Unit::Time);
+                const auto label = PerfParser::tr("off-CPU Time");
+                eventResult.offCpuTimeCostId = addCostType(label, Data::Costs::Unit::Time);
             }
 
             auto& totalCost = summaryResult.costs[eventResult.offCpuTimeCostId];
@@ -1136,7 +1250,8 @@ public:
                     addCallerCalleeEvent(symbol, location, eventResult.offCpuTimeCostId, switchTime, &recursionGuard,
                                          &callerCalleeResult, bottomUpResult.costs.numTypes());
                 };
-                bottomUpResult.addEvent(eventResult.offCpuTimeCostId, switchTime, frames, frameCallback);
+                addBottomUpResult(eventResult.offCpuTimeCostId, switchTime, contextSwitch.pid, contextSwitch.tid,
+                                  contextSwitch.cpu, frames, frameCallback);
             }
 
             Data::Event event;
@@ -1150,6 +1265,14 @@ public:
 
         thread->lastSwitchTime = contextSwitch.time;
         thread->state = contextSwitch.switchOut ? Data::ThreadEvents::OffCpu : Data::ThreadEvents::OnCpu;
+    }
+
+    template<typename FrameCallback>
+    void addBottomUpResult(int type, quint64 cost, qint32 pid, qint32 tid, quint32 cpu, const QVector<qint32>& frames,
+                           const FrameCallback& frameCallback)
+    {
+        ::addBottomUpResult(&bottomUpResult, costAggregation, commands, type, cost, pid, tid, cpu, frames,
+                            frameCallback);
     }
 
     void addLost(const LostDefinition& lost)
@@ -1240,6 +1363,7 @@ public:
         ContextSwitchDefinition,
         Sample,
         TracePointSample,
+        DebugInfoDownloadProgress,
         InvalidType
     };
 
@@ -1256,10 +1380,13 @@ public:
     QSet<quint32> uniqueProcess;
     Data::BottomUpResults bottomUpResult;
     Data::TopDownResults topDownResult;
+    Data::PerLibraryResults perLibraryResult;
     Data::CallerCalleeResults callerCalleeResult;
     Data::EventResults eventResult;
-    QHash<qint32, QHash<qint32, QString>> commands;
-    QScopedPointer<QTextStream> perfScriptOutput;
+    Data::TracepointResults tracepointResult;
+    Data::FrequencyResults frequencyResult;
+    Data::ThreadNames commands;
+    std::unique_ptr<QTextStream> perfScriptOutput;
     QHash<qint32, SymbolCount> numSymbolsByModule;
     QSet<QString> encounteredErrors;
     QHash<QVector<qint32>, qint32> stacks;
@@ -1268,6 +1395,9 @@ public:
     QHash<int, qint32> attributeNameToCostIds;
     qint32 m_nextCostId = 0;
     qint32 m_schedSwitchCostId = -1;
+    QHash<quint32, quint64> m_lastSampleTimePerCore;
+    Settings::CostAggregation costAggregation;
+    bool perfMapFileExists = false;
 
     // samples recorded without --call-graph have only one frame
     int m_numSamplesWithMoreThanOneFrame = 0;
@@ -1280,13 +1410,28 @@ public slots:
 
 signals:
     void progress(float percent);
+    void debugInfoDownloadProgress(const QString& module, const QString& url, qint64 numerator, qint64 denominator);
 };
 
 PerfParser::PerfParser(QObject* parent)
     : QObject(parent)
     , m_isParsing(false)
     , m_stopRequested(false)
+    , m_costAggregationChanged(false)
 {
+    qRegisterMetaType<Data::Summary>();
+    qRegisterMetaType<Data::BottomUp>();
+    qRegisterMetaType<Data::TopDown>();
+    qRegisterMetaType<Data::CallerCalleeEntryMap>("Data::CallerCalleeEntryMap");
+    qRegisterMetaType<Data::BottomUpResults>();
+    qRegisterMetaType<Data::TopDownResults>();
+    qRegisterMetaType<Data::CallerCalleeResults>();
+    qRegisterMetaType<Data::EventResults>();
+    qRegisterMetaType<Data::PerLibraryResults>();
+    qRegisterMetaType<Data::TracepointResults>();
+    qRegisterMetaType<Data::FrequencyResults>();
+    qRegisterMetaType<Data::ThreadNames>();
+
     // set data via signal/slot connection to ensure we don't introduce a data race
     connect(this, &PerfParser::bottomUpDataAvailable, this, [this](const Data::BottomUpResults& data) {
         if (m_bottomUpResults.root.children.isEmpty()) {
@@ -1298,114 +1443,188 @@ PerfParser::PerfParser(QObject* parent)
             m_callerCalleeResults = data;
         }
     });
+    connect(this, &PerfParser::frequencyDataAvailable, this, [this](const Data::FrequencyResults& data) {
+        if (m_frequencyResults.cores.isEmpty()) {
+            m_frequencyResults = data;
+        }
+    });
     connect(this, &PerfParser::eventsAvailable, this, [this](const Data::EventResults& data) {
         if (m_events.threads.isEmpty()) {
             m_events = data;
         }
     });
+    connect(this, &PerfParser::tracepointDataAvailable, this, [this](const Data::TracepointResults& data) {
+        if (m_tracepointResults.tracepoints.isEmpty()) {
+            m_tracepointResults = data;
+        }
+    });
+    connect(this, &PerfParser::threadNamesAvailable, this,
+            [this](const Data::ThreadNames& threadNames) { m_threadNames = threadNames; });
     connect(this, &PerfParser::parsingStarted, this, [this]() {
         m_isParsing = true;
         m_stopRequested = false;
     });
-    connect(this, &PerfParser::parsingFailed, this, [this]() { m_isParsing = false; });
-    connect(this, &PerfParser::parsingFinished, this, [this]() { m_isParsing = false; });
+
+    auto parsingStopped = [this] {
+        m_isParsing = false;
+        m_decompressed.reset();
+    };
+
+    connect(Settings::instance(), &Settings::costAggregationChanged, this, [this] { m_costAggregationChanged = true; });
+
+    connect(this, &PerfParser::parsingFailed, this, parsingStopped);
+    connect(this, &PerfParser::parsingFinished, this, parsingStopped);
 }
 
 PerfParser::~PerfParser() = default;
 
-void PerfParser::startParseFile(const QString& path, const QString& sysroot, const QString& kallsyms,
-                                const QString& debugPaths, const QString& extraLibPaths, const QString& appPath,
-                                const QString& arch)
+bool PerfParser::initParserArgs(const QString& path)
 {
-    Q_ASSERT(!m_isParsing);
-
-    QFileInfo info(path);
+    // check for common file issues
+    const auto info = QFileInfo(path);
     if (!info.exists()) {
         emit parsingFailed(tr("File '%1' does not exist.").arg(path));
-        return;
+        return false;
     }
     if (!info.isFile()) {
         emit parsingFailed(tr("'%1' is not a file.").arg(path));
-        return;
+        return false;
     }
     if (!info.isReadable()) {
         emit parsingFailed(tr("File '%1' is not readable.").arg(path));
-        return;
+        return false;
     }
 
+    // peek into file header
+    const auto filename = decompressIfNeeded(path);
+    QFile file(filename);
+    file.open(QIODevice::ReadOnly);
+    if (file.peek(8) != "PERFILE2" && file.peek(11) != "QPERFSTREAM") {
+        if (file.peek(8) == "PERFFILE") {
+            emit parsingFailed(tr("Failed to parse file %1: %2").arg(path, tr("Unsupported V1 perf data")));
+        } else {
+            emit parsingFailed(tr("Failed to parse file %1: %2").arg(path, tr("File format unknown")));
+        }
+        file.close();
+        return false;
+    }
+    file.close();
+
+    // check perfparser and set initial values
     auto parserBinary = Util::perfParserBinaryPath();
     if (parserBinary.isEmpty()) {
         emit parsingFailed(tr("Failed to find hotspot-perfparser binary."));
+        return false;
+    }
+
+    auto parserArgs = [](const QString& filename) {
+        const auto settings = Settings::instance();
+        QStringList parserArgs = {QStringLiteral("--input"), filename, QStringLiteral("--max-frames"),
+                                  QStringLiteral("1024")};
+        const auto sysroot = settings->sysroot();
+        if (!sysroot.isEmpty()) {
+            parserArgs += {QStringLiteral("--sysroot"), sysroot};
+        }
+        const auto kallsyms = settings->kallsyms();
+        if (!kallsyms.isEmpty()) {
+            parserArgs += {QStringLiteral("--kallsyms"), kallsyms};
+        }
+        const auto debugPaths = settings->debugPaths();
+        if (!debugPaths.isEmpty()) {
+            parserArgs += {QStringLiteral("--debug"), debugPaths};
+        }
+        const auto extraLibPaths = settings->extraLibPaths();
+        if (!extraLibPaths.isEmpty()) {
+            parserArgs += {QStringLiteral("--extra"), extraLibPaths};
+        }
+        const auto appPath = settings->appPath();
+        if (!appPath.isEmpty()) {
+            parserArgs += {QStringLiteral("--app"), appPath};
+        }
+        const auto arch = settings->arch();
+        if (!arch.isEmpty()) {
+            parserArgs += {QStringLiteral("--arch"), arch};
+        }
+        const auto perfMapPath = settings->perfMapPath();
+        if (!perfMapPath.isEmpty()) {
+            parserArgs += {QStringLiteral("--perf-map-path"), perfMapPath};
+        }
+        return parserArgs;
+    };
+
+    m_parserArgs = parserArgs(filename);
+    m_parserBinary = parserBinary;
+    return true;
+}
+
+void PerfParser::startParseFile(const QString& path)
+{
+    Q_ASSERT(!m_isParsing);
+
+    // reset the data to ensure filtering will pick up the new data
+    if (!initParserArgs(path)) {
         return;
     }
 
-    QStringList parserArgs = {QStringLiteral("--input"), path, QStringLiteral("--max-frames"), QStringLiteral("1024")};
-    if (!sysroot.isEmpty()) {
-        parserArgs += {QStringLiteral("--sysroot"), sysroot};
-    }
-    if (!kallsyms.isEmpty()) {
-        parserArgs += {QStringLiteral("--kallsyms"), kallsyms};
-    }
-    if (!debugPaths.isEmpty()) {
-        parserArgs += {QStringLiteral("--debug"), debugPaths};
-    }
-    if (!extraLibPaths.isEmpty()) {
-        parserArgs += {QStringLiteral("--extra"), extraLibPaths};
-    }
-    if (!appPath.isEmpty()) {
-        parserArgs += {QStringLiteral("--app"), appPath};
-    }
-    if (!arch.isEmpty()) {
-        parserArgs += {QStringLiteral("--arch"), arch};
-    }
-
-    // reset the data to ensure filtering will pick up the new data
-    m_parserArgs = parserArgs;
     m_bottomUpResults = {};
     m_callerCalleeResults = {};
+    m_tracepointResults = {};
     m_events = {};
+    m_frequencyResults = {};
+
+    auto debuginfodUrls = Settings::instance()->debuginfodUrls();
+    const auto costAggregation = Settings::instance()->costAggregation();
 
     emit parsingStarted();
     using namespace ThreadWeaver;
-    stream() << make_job([path, parserBinary, parserArgs, this]() {
-        PerfParserPrivate d;
+    stream() << make_job([path, parserBinary = m_parserBinary, parserArgs = m_parserArgs, debuginfodUrls,
+                          costAggregation, this]() {
+        PerfParserPrivate d(costAggregation);
         connect(&d, &PerfParserPrivate::progress, this, &PerfParser::progress);
+        connect(&d, &PerfParserPrivate::debugInfoDownloadProgress, this, &PerfParser::debugInfoDownloadProgress);
         connect(this, &PerfParser::stopRequested, &d, &PerfParserPrivate::stop);
 
         auto finalize = [&d, this]() {
             d.finalize();
             emit bottomUpDataAvailable(d.bottomUpResult);
             emit topDownDataAvailable(d.topDownResult);
+            emit perLibraryDataAvailable(d.perLibraryResult);
             emit summaryDataAvailable(d.summaryResult);
             emit callerCalleeDataAvailable(d.callerCalleeResult);
+            emit tracepointDataAvailable(d.tracepointResult);
             emit eventsAvailable(d.eventResult);
-            emit parsingFinished();
+            emit frequencyDataAvailable(d.frequencyResult);
+            emit threadNamesAvailable(d.commands);
+            emit perfMapFileExists(d.perfMapFileExists);
 
             if (d.m_numSamplesWithMoreThanOneFrame == 0) {
                 emit parserWarning(tr("Samples contained no call stack frames. Consider passing <code>--call-graph "
                                       "dwarf</code> to <code>perf record</code>."));
             }
+
+            emit parsingFinished();
         };
 
-        if (path.endsWith(QLatin1String(".perfparser"))) {
-            QFile file(path);
-            if (!file.open(QIODevice::ReadOnly)) {
-                emit parsingFailed(tr("Failed to open file %1: %2").arg(path, file.errorString()));
-                return;
-            }
+        // note: file is always readable and in supported format here,
+        //        already validated in initParserArgs()
+        QFile file(path);
+        file.open(QIODevice::ReadOnly);
+        if (file.peek(11) == "QPERFSTREAM") {
             d.setInput(&file);
             while (!file.atEnd() && !d.stopRequested) {
                 if (!d.tryParse()) {
-                    emit parsingFailed(tr("Failed to parse file"));
+                    // TODO: provide reason
+                    emit parsingFailed(tr("Failed to parse file %1: %2").arg(path, QStringLiteral("Unknown reason")));
                     return;
                 }
             }
             finalize();
             return;
         }
+        file.close();
 
         QProcess process;
-        process.setProcessEnvironment(Util::appImageEnvironment());
+        process.setProcessEnvironment(perfparserEnvironment(debuginfodUrls));
         process.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         connect(this, &PerfParser::stopRequested, &process, &QProcess::kill);
 
@@ -1461,7 +1680,7 @@ void PerfParser::startParseFile(const QString& path, const QString& sysroot, con
                     }
                 });
 
-        connect(&process, &QProcess::errorOccurred, &process, [&d, &process, this](QProcess::ProcessError error) {
+        connect(&process, &QProcess::errorOccurred, &process, [&process, this](QProcess::ProcessError error) {
             if (m_stopRequested) {
                 emit parsingFailed(tr("Parsing stopped."));
                 return;
@@ -1491,18 +1710,26 @@ void PerfParser::filterResults(const Data::FilterAction& filter)
 
     emit parsingStarted();
     using namespace ThreadWeaver;
-    stream() << make_job([this, filter]() {
+    const auto costAggregation = Settings::instance()->costAggregation();
+    stream() << make_job([this, filter, costAggregation]() {
+        Queue queue;
+        queue.setMaximumNumberOfThreads(QThread::idealThreadCount());
+
         Data::BottomUpResults bottomUp;
         Data::EventResults events = m_events;
         Data::CallerCalleeResults callerCallee;
+        Data::TracepointResults tracepointResults = m_tracepointResults;
+        auto frequencyResults = m_frequencyResults;
         const bool filterByTime = filter.time.isValid();
         const bool filterByCpu = filter.cpuId != std::numeric_limits<quint32>::max();
         const bool excludeByCpu = !filter.excludeCpuIds.isEmpty();
         const bool includeBySymbol = !filter.includeSymbols.isEmpty();
         const bool excludeBySymbol = !filter.excludeSymbols.isEmpty();
-        const bool filterByStack = includeBySymbol || excludeBySymbol;
+        const bool includeByBinary = !filter.includeBinaries.isEmpty();
+        const bool excludeByBinary = !filter.excludeBinaries.isEmpty();
+        const bool filterByStack = includeBySymbol || excludeBySymbol || includeByBinary || excludeByBinary;
 
-        if (!filter.isValid()) {
+        if (!filter.isValid() && !m_costAggregationChanged) {
             bottomUp = m_bottomUpResults;
             callerCallee = m_callerCalleeResults;
         } else {
@@ -1522,27 +1749,70 @@ void PerfParser::filterResults(const Data::FilterAction& filter)
             QVector<bool> filterStacks;
             if (filterByStack) {
                 filterStacks.resize(m_events.stacks.size());
-                // TODO: parallelize
-                for (qint32 stackId = 0, c = m_events.stacks.size(); stackId < c; ++stackId) {
-                    // if empty, then all include filters are matched
-                    auto included = filter.includeSymbols;
-                    // if false, then none of the exclude filters matched
-                    bool excluded = false;
-                    m_bottomUpResults.foreachFrame(m_events.stacks.at(stackId),
-                                                   [&included, &excluded, &filter](const Data::Symbol& symbol,
-                                                                                   const Data::Location& /*location*/) {
-                                                       excluded = filter.excludeSymbols.contains(symbol);
-                                                       if (excluded) {
-                                                           return false;
-                                                       }
-                                                       included.remove(symbol);
-                                                       // only stop when we included everything and no exclude filter is
-                                                       // set
-                                                       return !included.isEmpty() || !filter.excludeSymbols.isEmpty();
-                                                   });
-                    filterStacks[stackId] = !excluded && included.isEmpty();
+
+                const auto threadCount = queue.maximumNumberOfThreads();
+                const auto jobsPerThread = m_events.stacks.size() / threadCount;
+
+                auto filterStack = [&filter, &filterStacks, this](int start, int stop) {
+                    for (qint32 stackId = start, c = stop; stackId < c; ++stackId) {
+                        //  if empty, then all include filters are matched
+                        auto includedSymbols = filter.includeSymbols;
+                        auto includedBinaries = filter.includeBinaries;
+                        // if false, then none of the exclude filters matched
+                        bool excluded = false;
+                        m_bottomUpResults.foreachFrame(
+                            m_events.stacks.at(stackId),
+                            [&includedSymbols, &includedBinaries, &excluded,
+                             &filter](const Data::Symbol& symbol, const Data::Location& /*location*/) {
+                                excluded = filter.excludeSymbols.contains(symbol);
+                                if (excluded) {
+                                    return false;
+                                }
+                                includedSymbols.remove(symbol);
+
+                                excluded = filter.excludeBinaries.contains(symbol.binary);
+                                if (excluded) {
+                                    return false;
+                                }
+                                includedBinaries.remove(symbol.binary);
+
+                                // only stop when we included everything and no exclude filter is
+                                // set
+                                return !includedSymbols.isEmpty() || !filter.excludeSymbols.isEmpty()
+                                    || includedBinaries.isEmpty() || !filter.excludeBinaries.isEmpty();
+                            });
+                        filterStacks[stackId] = !excluded && includedSymbols.isEmpty() && includedBinaries.isEmpty();
+                    }
+                };
+
+                for (int i = 0; i < threadCount - 1; i++) {
+                    queue.stream() << make_job(
+                        [filterStack, i, jobsPerThread] { filterStack(i * jobsPerThread, (i + 1) * jobsPerThread); });
+                }
+
+                queue.stream() << make_job([filterStack, threadCount, jobsPerThread, this] {
+                    filterStack((threadCount - 1) * jobsPerThread, m_events.stacks.size());
+                });
+            }
+
+            if (filterByTime) {
+                auto it = std::remove_if(
+                    tracepointResults.tracepoints.begin(), tracepointResults.tracepoints.end(),
+                    [filter](const Data::Tracepoint& tracepoint) { return !filter.time.contains(tracepoint.time); });
+                tracepointResults.tracepoints.erase(it, tracepointResults.tracepoints.end());
+
+                for (auto& core : frequencyResults.cores) {
+                    for (auto& costType : core.costs) {
+
+                        auto frequencyIt = std::remove_if(
+                            costType.values.begin(), costType.values.end(),
+                            [filter](Data::FrequencyData point) { return !filter.time.contains(point.time); });
+                        costType.values.erase(frequencyIt, costType.values.end());
+                    }
                 }
             }
+
+            queue.finish();
 
             // remove events that lie outside the selected time span
             // TODO: parallelize
@@ -1561,30 +1831,25 @@ void PerfParser::filterResults(const Data::FilterAction& filter)
                 }
 
                 if (filterByTime || filterByCpu || excludeByCpu || filterByStack) {
-                    auto it = std::remove_if(
-                        thread.events.begin(), thread.events.end(),
-                        [filter, filterByTime, filterByCpu, excludeByCpu, filterByStack,
-                         filterStacks](const Data::Event& event) {
-                            if (filterByTime && !filter.time.contains(event.time)) {
-                                return true;
-                            } else if (filterByCpu && event.cpuId != filter.cpuId) {
-                                return true;
-                            } else if (excludeByCpu && filter.excludeCpuIds.contains(event.cpuId)) {
-                                return true;
-                            } else if (filterByStack && event.stackId != -1 && !filterStacks[event.stackId]) {
-                                return true;
-                            }
-                            return false;
-                        });
+                    auto it = std::remove_if(thread.events.begin(), thread.events.end(),
+                                             [filter, filterByTime, filterByCpu, excludeByCpu, filterByStack,
+                                              filterStacks](const Data::Event& event) {
+                                                 return (filterByTime && !filter.time.contains(event.time))
+                                                     || (filterByCpu && event.cpuId != filter.cpuId)
+                                                     || (excludeByCpu && filter.excludeCpuIds.contains(event.cpuId))
+                                                     || (filterByStack && event.stackId != -1
+                                                         && !filterStacks[event.stackId]);
+                                             });
                     thread.events.erase(it, thread.events.end());
                 }
+
                 if (m_stopRequested) {
                     emit parsingFailed(tr("Parsing stopped."));
                     return;
                 }
 
                 // add event data to cpus, bottom up and caller callee sets
-                for (const auto& event : thread.events) {
+                for (const auto& event : std::as_const(thread.events)) {
                     // only add non-time events to the cpu line, context switches shouldn't show up there
                     if (event.type == events.lostEventCostId) {
                         // the lost event never has a valid cpu set, add to all CPUs
@@ -1602,7 +1867,8 @@ void PerfParser::filterResults(const Data::FilterAction& filter)
                     };
 
                     if (event.stackId != -1) {
-                        bottomUp.addEvent(event.type, event.cost, events.stacks.at(event.stackId), frameCallback);
+                        addBottomUpResult(&bottomUp, costAggregation, m_threadNames, event.type, event.cost, thread.pid,
+                                          thread.tid, event.cpuId, events.stacks.at(event.stackId), frameCallback);
                     }
                 }
             }
@@ -1628,16 +1894,23 @@ void PerfParser::filterResults(const Data::FilterAction& filter)
             return;
         }
 
-        const auto topDown = Data::TopDownResults::fromBottomUp(bottomUp);
+        const auto topDown =
+            Data::TopDownResults::fromBottomUp(bottomUp, costAggregation != Settings::CostAggregation::BySymbol);
+        const auto perLibrary = Data::PerLibraryResults::fromTopDown(topDown);
 
         if (m_stopRequested) {
             emit parsingFailed(tr("Parsing stopped."));
             return;
         }
 
+        m_costAggregationChanged = false;
+
         emit bottomUpDataAvailable(bottomUp);
         emit topDownDataAvailable(topDown);
+        emit perLibraryDataAvailable(perLibrary);
         emit callerCalleeDataAvailable(callerCallee);
+        emit frequencyDataAvailable(frequencyResults);
+        emit tracepointDataAvailable(tracepointResults);
         emit eventsAvailable(events);
         emit parsingFinished();
     });
@@ -1649,12 +1922,22 @@ void PerfParser::stop()
     emit stopRequested();
 }
 
+void PerfParser::exportResults(const QString& path, const QUrl& url)
+{
+    if (!initParserArgs(path))
+        return;
+    exportResults(url);
+}
+
 void PerfParser::exportResults(const QUrl& url)
 {
+    Q_ASSERT(!m_parserBinary.isEmpty());
     Q_ASSERT(!m_parserArgs.isEmpty());
 
     using namespace ThreadWeaver;
-    stream() << make_job([this, url]() {
+
+    auto debuginfodUrls = Settings::instance()->debuginfodUrls();
+    stream() << make_job([this, url, parserBinary = m_parserBinary, parserArgs = m_parserArgs, debuginfodUrls]() {
         QProcess perfParser;
         QSharedPointer<QTemporaryFile> tmpFile;
 
@@ -1665,7 +1948,7 @@ void PerfParser::exportResults(const QUrl& url)
         } else {
             tmpFile = QSharedPointer<QTemporaryFile>::create();
             if (!tmpFile->open()) {
-                emit parserWarning(
+                emit exportFailed(
                     tr("File export failed: Failed to create temporary file %1.").arg(tmpFile->errorString()));
                 return;
             }
@@ -1673,10 +1956,12 @@ void PerfParser::exportResults(const QUrl& url)
             perfParser.setStandardOutputFile(tmpFile->fileName());
         }
 
-        perfParser.setStandardErrorFile(QProcess::nullDevice());
-        perfParser.start(Util::perfParserBinaryPath(), m_parserArgs);
+        perfParser.setProcessEnvironment(perfparserEnvironment(debuginfodUrls));
+        perfParser.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+
+        perfParser.start(parserBinary, parserArgs);
         if (!perfParser.waitForFinished(-1)) {
-            emit parserWarning(tr("File export failed: %1").arg(perfParser.errorString()));
+            emit exportFailed(tr("File export failed: %1").arg(perfParser.errorString()));
             return;
         }
 
@@ -1690,7 +1975,7 @@ void PerfParser::exportResults(const QUrl& url)
             auto* job = KIO::file_move(QUrl::fromLocalFile(tmpFile->fileName()), url, -1, KIO::Overwrite);
             connect(job, &KIO::FileCopyJob::result, this, [this, url, job, tmpFile]() {
                 if (job->error())
-                    emit parserWarning(tr("File export failed: %1").arg(job->errorString()));
+                    emit exportFailed(tr("File export failed: %1").arg(job->errorString()));
                 else
                     emit exportFinished(url);
                 // we need to keep the file alive until the copy job has finished
@@ -1699,6 +1984,39 @@ void PerfParser::exportResults(const QUrl& url)
             job->start();
         });
     });
+}
+
+QString PerfParser::decompressIfNeeded(const QString& path)
+{
+#if KFArchive_FOUND
+    m_decompressed = std::make_unique<QTemporaryFile>(this);
+
+    KCompressionDevice compressedFile(path);
+
+    if (compressedFile.compressionType() == KCompressionDevice::None) {
+        return path;
+    }
+
+    if (compressedFile.open(QIODevice::ReadOnly)) {
+        m_decompressed->open();
+
+        const int chunkSize = 1024 * 100;
+
+        QByteArray buffer;
+        buffer.resize(chunkSize);
+
+        while (!compressedFile.atEnd()) {
+            const auto size = compressedFile.read(buffer.data(), buffer.size());
+            m_decompressed->write(buffer.data(), size);
+        }
+        m_decompressed->flush();
+
+        compressedFile.close();
+        return m_decompressed->fileName();
+    }
+#endif
+    // fallback
+    return path;
 }
 
 #include "perfparser.moc"

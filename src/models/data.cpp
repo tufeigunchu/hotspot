@@ -1,28 +1,8 @@
 /*
-  data.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "data.h"
@@ -35,13 +15,14 @@ using namespace Data;
 namespace {
 
 ItemCost buildTopDownResult(const BottomUp& bottomUpData, const Costs& bottomUpCosts, TopDown* topDownData,
-                            Costs* inclusiveCosts, Costs* selfCosts, quint32* maxId)
+                            Costs* inclusiveCosts, Costs* selfCosts, quint32* maxId, bool skipFirstLevel)
 {
     ItemCost totalCost;
     totalCost.resize(bottomUpCosts.numTypes(), 0);
     for (const auto& row : bottomUpData.children) {
         // recurse and find the cost attributed to children
-        const auto childCost = buildTopDownResult(row, bottomUpCosts, topDownData, inclusiveCosts, selfCosts, maxId);
+        const auto childCost =
+            buildTopDownResult(row, bottomUpCosts, topDownData, inclusiveCosts, selfCosts, maxId, skipFirstLevel);
         const auto rowCost = bottomUpCosts.itemCost(row.id);
         const auto diff = rowCost - childCost;
         if (diff.sum() != 0) {
@@ -52,12 +33,16 @@ ItemCost buildTopDownResult(const BottomUp& bottomUpData, const Costs& bottomUpC
             while (node) {
                 auto frame = stack->entryForSymbol(node->symbol, maxId);
 
+                const auto isLastNode = !node->parent || (skipFirstLevel && !node->parent->parent);
+
                 // always use the leaf node's cost and propagate that one up the chain
                 // otherwise we'd count the cost of some nodes multiple times
                 inclusiveCosts->add(frame->id, diff);
-                if (!node->parent) {
+                if (isLastNode) {
                     selfCosts->add(frame->id, diff);
+                    break;
                 }
+
                 stack = frame;
                 node = node->parent;
             }
@@ -134,7 +119,7 @@ ItemCost buildCallerCalleeResult(const BottomUp& data, const Costs& bottomUpCost
     return totalCost;
 }
 
-static int findSameDepth(const QStringRef& str, int offset, QChar ch, bool returnNext = false)
+int findSameDepth(QStringView str, int offset, QChar ch, bool returnNext = false)
 {
     const int size = str.size();
 
@@ -155,7 +140,7 @@ static int findSameDepth(const QStringRef& str, int offset, QChar ch, bool retur
 }
 
 template<typename T>
-static int startsWith(const QStringRef& str, const std::initializer_list<T>& prefixes)
+int startsWith(QStringView str, const std::initializer_list<T>& prefixes)
 {
     for (const auto& prefix_ : prefixes) {
         const auto prefix = QLatin1String(prefix_);
@@ -166,7 +151,7 @@ static int startsWith(const QStringRef& str, const std::initializer_list<T>& pre
     return -1;
 }
 
-QString prettifySymbol(const QStringRef& str)
+QString prettifySymbol(QStringView str)
 {
     int pos = 0;
     do {
@@ -272,23 +257,75 @@ QString prettifySymbol(const QStringRef& str)
 
     return result;
 }
+
+void buildPerLibrary(const TopDown* node, PerLibraryResults& results, QHash<QString, int>& pathToResultIndex,
+                     const Costs& costs)
+{
+    for (const auto& child : node->children) {
+        const auto path = child.symbol.path;
+
+        auto resultIndexIt = pathToResultIndex.find(path);
+        if (resultIndexIt == pathToResultIndex.end()) {
+            resultIndexIt = pathToResultIndex.insert(path, pathToResultIndex.size());
+
+            PerLibrary library;
+            library.id = *resultIndexIt;
+            library.symbol = Symbol({}, 0, 0, child.symbol.binary, child.symbol.path, child.symbol.actualPath,
+                                    child.symbol.isKernel);
+            results.root.children.push_back(library);
+        }
+
+        const auto cost = costs.itemCost(child.id);
+        results.costs.add(*resultIndexIt, cost);
+
+        buildPerLibrary(&child, results, pathToResultIndex, costs);
+    }
+}
 }
 
 QString Data::prettifySymbol(const QString& name)
 {
-    const auto result = ::prettifySymbol(QStringRef(&name));
+    const auto result = ::prettifySymbol(QStringView(name));
     return result == name ? name : result;
 }
 
-TopDownResults TopDownResults::fromBottomUp(const BottomUpResults& bottomUpData)
+TopDownResults TopDownResults::fromBottomUp(const BottomUpResults& bottomUpData, bool skipFirstLevel)
 {
     TopDownResults results;
     results.selfCosts.initializeCostsFrom(bottomUpData.costs);
     results.inclusiveCosts.initializeCostsFrom(bottomUpData.costs);
     quint32 maxId = 0;
-    buildTopDownResult(bottomUpData.root, bottomUpData.costs, &results.root, &results.inclusiveCosts,
-                       &results.selfCosts, &maxId);
+    if (skipFirstLevel) {
+        results.root.children.reserve(bottomUpData.root.children.size());
+        for (const auto& bottomUpGroup : bottomUpData.root.children) {
+            // manually copy the first level
+            auto topDownGroup = results.root.entryForSymbol(bottomUpGroup.symbol, &maxId);
+            // then traverse the children as separate trees basically
+            buildTopDownResult(bottomUpGroup, bottomUpData.costs, topDownGroup, &results.inclusiveCosts,
+                               &results.selfCosts, &maxId, true);
+            // finally manually sum up the inclusive costs
+            for (const auto& child : std::as_const(topDownGroup->children)) {
+                results.inclusiveCosts.add(topDownGroup->id, results.inclusiveCosts.itemCost(child.id));
+            }
+        }
+    } else {
+        buildTopDownResult(bottomUpData.root, bottomUpData.costs, &results.root, &results.inclusiveCosts,
+                           &results.selfCosts, &maxId, false);
+    }
     TopDown::initializeParents(&results.root);
+    return results;
+}
+
+PerLibraryResults PerLibraryResults::fromTopDown(const TopDownResults& topDownData)
+{
+    PerLibraryResults results;
+    QHash<QString, int> pathToResultIndex;
+    results.costs.initializeCostsFrom(topDownData.selfCosts);
+
+    buildPerLibrary(&topDownData.root, results, pathToResultIndex, topDownData.selfCosts);
+
+    PerLibrary::initializeParents(&results.root);
+
     return results;
 }
 
@@ -309,12 +346,20 @@ QDebug Data::operator<<(QDebug stream, const Symbol& symbol)
     return stream.resetFormat().space();
 }
 
+QDebug Data::operator<<(QDebug stream, const FileLine& fileLine)
+{
+    stream.noquote().nospace() << "FileLine{"
+                               << "file=" << fileLine.file << ", "
+                               << "line=" << fileLine.line << "}";
+    return stream.resetFormat().space();
+}
+
 QDebug Data::operator<<(QDebug stream, const Location& location)
 {
     stream.noquote().nospace() << "Location{"
                                << "address=" << location.address << ", "
                                << "relAddr=" << location.relAddr << ", "
-                               << "location=" << location.location << "}";
+                               << "fileLine=" << location.fileLine << "}";
     return stream.resetFormat().space();
 }
 

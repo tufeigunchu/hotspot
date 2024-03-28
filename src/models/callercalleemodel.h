@@ -1,28 +1,9 @@
 /*
-  callercalleemodel.h
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
@@ -58,7 +39,6 @@ public:
     {
         SortRole = Qt::UserRole,
         TotalCostRole,
-        FilterRole,
         CalleesRole,
         CallersRole,
         SourceMapRole,
@@ -123,7 +103,6 @@ public:
     {
         SortRole = Qt::UserRole,
         TotalCostRole,
-        FilterRole,
         SymbolRole
     };
 
@@ -167,9 +146,6 @@ public:
             return costs[column - NUM_BASE_COLUMNS];
         } else if (role == TotalCostRole && column >= NUM_BASE_COLUMNS) {
             return m_costs.totalCost(column - NUM_BASE_COLUMNS);
-        } else if (role == FilterRole) {
-            // TODO: optimize this
-            return QString(Util::formatSymbol(symbol, false) + symbol.binary);
         } else if (role == Qt::DisplayRole) {
             switch (column) {
             case Symbol:
@@ -250,8 +226,7 @@ public:
     {
         SortRole = Qt::UserRole,
         TotalCostRole,
-        FilterRole,
-        LocationRole
+        FileLineRole,
     };
 
     QVariant headerCell(int column, int role) const final override
@@ -285,11 +260,12 @@ public:
         return {};
     }
 
-    QVariant cell(int column, int role, const QString& location, const Data::LocationCost& costs) const final override
+    QVariant cell(int column, int role, const Data::FileLine& fileLine,
+                  const Data::LocationCost& costs) const final override
     {
         if (role == SortRole) {
             if (column == Location) {
-                return location;
+                return QVariant::fromValue(fileLine);
             }
             column -= NUM_BASE_COLUMNS;
             if (column < m_totalCosts.numTypes()) {
@@ -303,16 +279,13 @@ public:
                 column -= m_totalCosts.numTypes();
             }
             return m_totalCosts.totalCost(column);
-        } else if (role == FilterRole) {
-            return location;
         } else if (role == Qt::DisplayRole) {
             if (column == Location) {
-                if (location.isEmpty()) {
+                if (!fileLine.isValid()) {
                     return ModelImpl::tr("??");
                 }
                 // only show the file name, not the full path
-                auto slashIdx = location.lastIndexOf(QLatin1Char('/')) + 1;
-                return location.mid(slashIdx);
+                return fileLine.toShortString();
             }
             column -= NUM_BASE_COLUMNS;
             if (column < m_totalCosts.numTypes()) {
@@ -320,10 +293,10 @@ public:
             }
             column -= m_totalCosts.numTypes();
             return Util::formatCostRelative(costs.inclusiveCost[column], m_totalCosts.totalCost(column), true);
-        } else if (role == LocationRole) {
-            return QVariant::fromValue(location);
+        } else if (role == FileLineRole) {
+            return QVariant::fromValue(fileLine);
         } else if (role == Qt::ToolTipRole) {
-            return Util::formatTooltip(location, costs, m_totalCosts);
+            return Util::formatTooltip(fileLine, costs, m_totalCosts);
         }
 
         return {};

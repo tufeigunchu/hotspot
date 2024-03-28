@@ -1,28 +1,9 @@
 /*
-  multiconfigwidget.cpp
+    SPDX-FileCopyrightText: Lieven Hey <lieven.hey@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2021 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Lieven Hey <lieven.hey@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "multiconfigwidget.h"
@@ -36,7 +17,7 @@ MultiConfigWidget::MultiConfigWidget(QWidget* parent)
     : QWidget(parent)
 {
     auto* layout = new QHBoxLayout(this);
-    layout->setMargin(0);
+    layout->setContentsMargins(0, 0, 0, 0);
 
     m_comboBox = new QComboBox(this);
     m_comboBox->setEditable(true);
@@ -94,6 +75,9 @@ void MultiConfigWidget::setConfig(const KConfigGroup& group)
 {
     m_comboBox->clear();
     m_config = group;
+
+    if (!m_config.isValid())
+        return;
 
     const auto groups = m_config.groupList();
     for (const auto& config : groups) {

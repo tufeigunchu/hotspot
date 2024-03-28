@@ -1,28 +1,9 @@
 /*
-  recordpage.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "recordpage.h"
@@ -30,12 +11,14 @@
 
 #include "processfiltermodel.h"
 #include "processmodel.h"
+#include "recordhost.h"
 #include "resultsutil.h"
 #include "util.h"
 
 #include <QDebug>
 #include <QKeyEvent>
 #include <QListView>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QShortcut>
 #include <QStandardItemModel>
@@ -47,19 +30,19 @@
 #include <KColumnResizer>
 #include <KComboBox>
 #include <KConfigGroup>
-#include <KParts/ReadOnlyPart>
-#include <KService>
 #include <KSharedConfig>
 #include <KShell>
 #include <KUrlCompletion>
 #include <KUrlRequester>
-#include <Solid/Device>
-#include <Solid/Processor>
-#include <kde_terminal_interface.h>
+#include <kcoreaddons_version.h>
 #include <kio_version.h>
 
-#include <QRegularExpression>
+#include <Solid/Device>
+#include <Solid/Processor>
 
+#include "multiconfigwidget.h"
+#include "perfoutputwidgetkonsole.h"
+#include "perfoutputwidgettext.h"
 #include "perfrecord.h"
 
 namespace {
@@ -85,46 +68,20 @@ bool isIntel()
         || instructionSets.testFlag(Processor::IntelSse41) || instructionSets.testFlag(Processor::IntelSse42);
 }
 
-RecordType selectedRecordType(const QScopedPointer<Ui::RecordPage>& ui)
+RecordType selectedRecordType(const std::unique_ptr<Ui::RecordPage>& ui)
 {
     return ui->recordTypeComboBox->currentData().value<RecordType>();
 }
 
-void updateStartRecordingButtonState(const QScopedPointer<Ui::RecordPage>& ui)
-{
-    if (!PerfRecord::isPerfInstalled()) {
-        ui->startRecordingButton->setEnabled(false);
-        ui->applicationRecordErrorMessage->setText(QObject::tr("Please install perf before trying to record."));
-        ui->applicationRecordErrorMessage->setVisible(true);
-        return;
-    }
-
-    bool enabled = false;
-    switch (selectedRecordType(ui)) {
-    case LaunchApplication:
-        enabled = ui->applicationName->url().isValid();
-        break;
-    case AttachToProcess:
-        enabled = ui->processesTableView->selectionModel()->hasSelection();
-        break;
-    case ProfileSystem:
-        enabled = true;
-        break;
-    case NUM_RECORD_TYPES:
-        break;
-    }
-    enabled &= ui->applicationRecordErrorMessage->text().isEmpty();
-
-    ui->startRecordingButton->setEnabled(enabled);
-}
-
 KConfigGroup config()
 {
-    return KSharedConfig::openConfig()->group("RecordPage");
+    return KSharedConfig::openConfig()->group(QStringLiteral("RecordPage"));
 }
 
 KConfigGroup applicationConfig(const QString& application)
 {
+    if (application.isEmpty())
+        return {};
     return config().group(QLatin1String("Application ") + KShell::tildeExpand(application));
 }
 
@@ -176,8 +133,9 @@ void rememberApplication(const QString& application, const QString& appParameter
 
 RecordPage::RecordPage(QWidget* parent)
     : QWidget(parent)
-    , ui(new Ui::RecordPage)
-    , m_perfRecord(new PerfRecord(this))
+    , ui(std::make_unique<Ui::RecordPage>())
+    , m_recordHost(new RecordHost(this))
+    , m_perfRecord(new PerfRecord(m_recordHost, this))
     , m_updateRuntimeTimer(new QTimer(this))
     , m_watcher(new QFutureWatcher<ProcDataList>(this))
 {
@@ -187,31 +145,103 @@ RecordPage::RecordPage(QWidget* parent)
         auto* scrollArea = new QScrollArea(this);
         scrollArea->setFrameStyle(QFrame::NoFrame);
         layout->addWidget(scrollArea);
-        auto *contents = new QWidget(this);
+        auto* contents = new QWidget(this);
         scrollArea->setWidget(contents);
         scrollArea->setWidgetResizable(true);
 
         ui->setupUi(contents);
     }
 
-    auto completion = ui->applicationName->completionObject();
+    connect(m_recordHost, &RecordHost::errorOccurred, this, &RecordPage::setError);
+    connect(m_recordHost, &RecordHost::isReadyChanged, this,
+            [this](bool isReady) { ui->startRecordingButton->setEnabled(isReady); });
+
+    connect(m_recordHost, &RecordHost::isPerfInstalledChanged, this, [this](bool isInstalled) {
+        if (!isInstalled) {
+            ui->startRecordingButton->setEnabled(false);
+            ui->applicationRecordErrorMessage->setText(QObject::tr("Please install perf before trying to record."));
+            ui->applicationRecordErrorMessage->setVisible(true);
+        }
+    });
+
+    connect(m_recordHost, &RecordHost::clientApplicationChanged, this, [this](const QString& filePath) {
+        const auto config = applicationConfig(filePath);
+        ui->workingDirectory->setText(config.readEntry("workingDir", QString()));
+        ui->applicationParametersBox->setText(config.readEntry("params", QString()));
+
+        m_multiConfig->setConfig(applicationConfig(ui->applicationName->text()));
+    });
+
+    ui->compressionComboBox->addItem(tr("Disabled"), -1);
+    ui->compressionComboBox->addItem(tr("Enabled (Default Level)"), 0);
+    ui->compressionComboBox->addItem(tr("Level 1 (Fastest)"), 1);
+    for (int i = 2; i <= 21; ++i)
+        ui->compressionComboBox->addItem(tr("Level %1").arg(i), 0);
+    ui->compressionComboBox->addItem(tr("Level 22 (Slowest)"), 22);
+    ui->compressionComboBox->setCurrentIndex(1);
+    const auto defaultLevel = ui->compressionComboBox->currentData().toInt();
+    const auto level = config().readEntry(QStringLiteral("compressionLevel"), defaultLevel);
+    const auto index = ui->compressionComboBox->findData(level);
+    if (index != -1)
+        ui->compressionComboBox->setCurrentIndex(index);
+
+    connect(m_recordHost, &RecordHost::perfCapabilitiesChanged, this,
+            [this](RecordHost::PerfCapabilities capabilities) {
+                ui->sampleCpuCheckBox->setVisible(capabilities.canSampleCpu);
+                ui->sampleCpuLabel->setVisible(capabilities.canSampleCpu);
+
+                ui->offCpuCheckBox->setVisible(capabilities.canSwitchEvents);
+                ui->offCpuLabel->setVisible(capabilities.canSwitchEvents);
+
+                ui->useAioCheckBox->setVisible(capabilities.canUseAio);
+                ui->useAioLabel->setVisible(capabilities.canUseAio);
+
+                ui->compressionComboBox->setVisible(capabilities.canCompress);
+                ui->compressionLabel->setVisible(capabilities.canCompress);
+
+                ui->offCpuCheckBox->setCheckable(capabilities.libtraceeventSupport);
+
+                if (!capabilities.libtraceeventSupport) {
+                    ui->offCpuCheckBox->setChecked(false);
+                    ui->offCpuCheckBox->setText(
+                        tr("perf doesn't support libtraceevent, you may need to build perf manually to support this"));
+                }
+
+                if (!capabilities.canElevatePrivileges) {
+                    ui->elevatePrivilegesCheckBox->setChecked(false);
+                    ui->elevatePrivilegesCheckBox->setEnabled(false);
+                    ui->elevatePrivilegesCheckBox->setText(
+                        tr("(Note: Install pkexec, kdesudo, kdesu or KAuth to temporarily elevate perf privileges.)"));
+                } else {
+                    ui->elevatePrivilegesCheckBox->setEnabled(true);
+                    ui->elevatePrivilegesCheckBox->setText({});
+                }
+            });
+
+    m_recordHost->setHost(QStringLiteral("localhost"));
+
     ui->applicationName->comboBox()->setEditable(true);
-    // NOTE: workaround until https://phabricator.kde.org/D7966 has landed and we bump the required version
-    ui->applicationName->comboBox()->setCompletionObject(completion);
     ui->applicationName->setMode(KFile::File | KFile::ExistingOnly | KFile::LocalOnly);
-#if KIO_VERSION >= QT_VERSION_CHECK(5, 31, 0)
+
     // we are only interested in executable files, so set the mime type filter accordingly
     // note that exe's build with PIE are actually "shared libs"...
     ui->applicationName->setMimeTypeFilters(
         {QStringLiteral("application/x-executable"), QStringLiteral("application/x-sharedlib")});
-#endif
+
     ui->workingDirectory->setMode(KFile::Directory | KFile::LocalOnly);
-    ui->applicationRecordErrorMessage->setCloseButtonVisible(false);
-    ui->applicationRecordErrorMessage->setWordWrap(true);
-    ui->applicationRecordErrorMessage->setMessageType(KMessageWidget::Error);
     ui->outputFile->setText(QDir::currentPath() + QDir::separator() + QStringLiteral("perf.data"));
+    m_recordHost->setOutputFileName(QDir::currentPath() + QDir::separator() + QStringLiteral("perf.data"));
     ui->outputFile->setMode(KFile::File | KFile::LocalOnly);
     ui->eventTypeBox->lineEdit()->setPlaceholderText(tr("perf defaults (usually cycles:Pu)"));
+
+    m_perfOutput = PerfOutputWidgetKonsole::create(this);
+    if (!m_perfOutput) {
+        m_perfOutput = new PerfOutputWidgetText(this);
+    }
+    ui->recordOutputBoxLayout->addWidget(m_perfOutput);
+
+    connect(m_perfOutput, &PerfOutputWidget::sendInput, this,
+            [this](const QByteArray& input) { m_perfRecord->sendInput(input); });
 
     auto saveFunction = [this](KConfigGroup group) {
         group.writeEntry("params", ui->applicationParametersBox->text());
@@ -244,28 +274,27 @@ RecordPage::RecordPage(QWidget* parent)
     columnResizer->addWidgetsFromLayout(ui->formLayout_3);
 
     connect(ui->homeButton, &QPushButton::clicked, this, &RecordPage::homeButtonClicked);
-    connect(ui->applicationName, &KUrlRequester::textChanged, this, &RecordPage::onApplicationNameChanged);
-    // NOTE: workaround until https://phabricator.kde.org/D7968 has landed and we bump the required version
-    connect(ui->applicationName->comboBox()->lineEdit(), &QLineEdit::textChanged, this,
-            &RecordPage::onApplicationNameChanged);
+    connect(ui->applicationName, &KUrlRequester::textChanged, m_recordHost, &RecordHost::setClientApplication);
     connect(ui->startRecordingButton, &QPushButton::toggled, this, &RecordPage::onStartRecordingButtonClicked);
-    connect(ui->workingDirectory, &KUrlRequester::textChanged, this, &RecordPage::onWorkingDirectoryNameChanged);
-    connect(ui->viewPerfRecordResultsButton, &QPushButton::clicked, this,
-            &RecordPage::onViewPerfRecordResultsButtonClicked);
-    connect(ui->outputFile, &KUrlRequester::textChanged, this, &RecordPage::onOutputFileNameChanged);
-    connect(ui->outputFile, static_cast<void (KUrlRequester::*)(const QString&)>(&KUrlRequester::returnPressed), this,
-            &RecordPage::onOutputFileNameSelected);
-    connect(ui->outputFile, &KUrlRequester::urlSelected, this, &RecordPage::onOutputFileUrlChanged);
+    connect(ui->workingDirectory, &KUrlRequester::textChanged, m_recordHost, &RecordHost::setCurrentWorkingDirectory);
+    connect(ui->viewPerfRecordResultsButton, &QPushButton::clicked, this, [this] { emit openFile(m_resultsFile); });
+    connect(ui->outputFile, &KUrlRequester::textChanged, m_recordHost, &RecordHost::setOutputFileName);
+    connect(ui->outputFile, static_cast<void (KUrlRequester::*)(const QString&)>(&KUrlRequester::returnPressed),
+            m_recordHost, &RecordHost::setOutputFileName);
+    connect(ui->outputFile, &KUrlRequester::urlSelected, m_recordHost,
+            [this](const QUrl& url) { m_recordHost->setOutputFileName(url.toLocalFile()); });
 
     ui->recordTypeComboBox->addItem(QIcon::fromTheme(QStringLiteral("run-build")), tr("Launch Application"),
-                                    QVariant::fromValue(LaunchApplication));
+                                    QVariant::fromValue(RecordType::LaunchApplication));
     ui->recordTypeComboBox->addItem(QIcon::fromTheme(QStringLiteral("run-install")), tr("Attach To Process(es)"),
-                                    QVariant::fromValue(AttachToProcess));
+                                    QVariant::fromValue(RecordType::AttachToProcess));
     ui->recordTypeComboBox->addItem(QIcon::fromTheme(QStringLiteral("run-build-install-root")), tr("Profile System"),
-                                    QVariant::fromValue(ProfileSystem));
-    connect(ui->recordTypeComboBox, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
+                                    QVariant::fromValue(RecordType::ProfileSystem));
+    connect(ui->recordTypeComboBox, qOverload<int>(&QComboBox::currentIndexChanged), this,
             &RecordPage::updateRecordType);
-    updateRecordType();
+    connect(ui->recordTypeComboBox, qOverload<int>(&QComboBox::currentIndexChanged), m_recordHost,
+            [this] { m_recordHost->setRecordType(ui->recordTypeComboBox->currentData().value<RecordType>()); });
+    connect(m_recordHost, &RecordHost::clientApplicationChanged, this, &RecordPage::updateRecordType);
 
     {
         ui->callGraphComboBox->addItem(tr("None"), QVariant::fromValue(QString()));
@@ -330,7 +359,7 @@ RecordPage::RecordPage(QWidget* parent)
                 m_updateRuntimeTimer->start();
                 appendOutput(QLatin1String("$ ") + perfBinary + QLatin1Char(' ') + arguments.join(QLatin1Char(' '))
                              + QLatin1Char('\n'));
-                ui->perfInputEdit->setEnabled(true);
+                m_perfOutput->enableInput(true);
             });
 
     connect(m_perfRecord, &PerfRecord::recordingFinished, this, [this](const QString& fileLocation) {
@@ -353,13 +382,12 @@ RecordPage::RecordPage(QWidget* parent)
         ui->viewPerfRecordResultsButton->setEnabled(false);
     });
 
-    connect(m_perfRecord, &PerfRecord::recordingOutput, this, &RecordPage::appendOutput);
-
-    connect(ui->perfInputEdit, &QLineEdit::returnPressed, this, [this]() {
-        m_perfRecord->sendInput(ui->perfInputEdit->text().toUtf8());
-        m_perfRecord->sendInput(QByteArrayLiteral("\n"));
-        ui->perfInputEdit->clear();
+    connect(m_perfRecord, &PerfRecord::debuggeeCrashed, this, [this] {
+        ui->applicationRecordWarningMessage->setText(tr("Debugge crashed. Results may be unusable."));
+        ui->applicationRecordWarningMessage->show();
     });
+
+    connect(m_perfRecord, &PerfRecord::recordingOutput, this, &RecordPage::appendOutput);
 
     m_processModel = new ProcessModel(this);
     m_processProxyModel = new ProcessFilterModel(this);
@@ -375,43 +403,67 @@ RecordPage::RecordPage(QWidget* parent)
     ui->processesTableView->setSelectionBehavior(QAbstractItemView::SelectRows);
     ui->processesTableView->setSelectionMode(QAbstractItemView::MultiSelection);
     connect(ui->processesTableView->selectionModel(), &QItemSelectionModel::selectionChanged, this,
-            [this]() { updateStartRecordingButtonState(ui); });
+            [this](const QItemSelection&, const QItemSelection&) {
+                const auto selection = ui->processesTableView->selectionModel()->selectedRows();
+                QStringList pids;
+                pids.reserve(selection.size());
+                for (const auto& item : selection) {
+                    pids.append(item.data(ProcessModel::PIDRole).toString());
+                }
+                m_recordHost->setPids(pids);
+            });
 
     ResultsUtil::connectFilter(ui->processesFilterBox, m_processProxyModel);
 
     connect(m_watcher, &QFutureWatcher<ProcDataList>::finished, this, &RecordPage::updateProcessesFinished);
 
-    if (m_perfRecord->currentUsername() == QLatin1String("root")) {
-        ui->elevatePrivilegesCheckBox->setChecked(true);
-        ui->elevatePrivilegesCheckBox->setEnabled(false);
-    } else if (m_perfRecord->sudoUtil().isEmpty()) {
-        ui->elevatePrivilegesCheckBox->setChecked(false);
-        ui->elevatePrivilegesCheckBox->setEnabled(false);
-        ui->elevatePrivilegesCheckBox->setText(
-            tr("(Note: Install pkexec, kdesudo or kdesu to temporarily elevate perf privileges.)"));
-    }
+    auto updateOffCpuCheckboxState = [this](RecordHost::PerfCapabilities capabilities) {
+        const bool enableOffCpuProfiling = (ui->elevatePrivilegesCheckBox->isChecked() || capabilities.canProfileOffCpu)
+            && capabilities.canSwitchEvents && capabilities.libtraceeventSupport;
 
-    connect(ui->elevatePrivilegesCheckBox, &QCheckBox::toggled, this, &RecordPage::updateOffCpuCheckboxState);
+        if (enableOffCpuProfiling == ui->offCpuCheckBox->isEnabled()) {
+            return;
+        }
+
+        ui->offCpuCheckBox->setEnabled(enableOffCpuProfiling);
+
+        // prevent user confusion: don't show the value as checked when the checkbox is disabled
+        if (!enableOffCpuProfiling) {
+            // remember the current value
+            config().writeEntry(QStringLiteral("offCpuProfiling"), ui->offCpuCheckBox->isChecked());
+            ui->offCpuCheckBox->setChecked(false);
+        } else {
+            ui->offCpuCheckBox->setChecked(config().readEntry(QStringLiteral("offCpuProfiling"), false));
+        }
+    };
+
+    connect(ui->elevatePrivilegesCheckBox, &QCheckBox::toggled, this,
+            [this, updateOffCpuCheckboxState] { updateOffCpuCheckboxState(m_recordHost->perfCapabilities()); });
+
+    connect(m_recordHost, &RecordHost::perfCapabilitiesChanged, this, updateOffCpuCheckboxState);
 
     restoreCombobox(config(), QStringLiteral("applications"), ui->applicationName->comboBox());
     restoreCombobox(config(), QStringLiteral("eventType"), ui->eventTypeBox, {ui->eventTypeBox->currentText()});
     restoreCombobox(config(), QStringLiteral("customOptions"), ui->perfParams);
+
+    // set application in RecordHost if it was restored
+    m_recordHost->setClientApplication(ui->applicationName->text());
+
     ui->elevatePrivilegesCheckBox->setChecked(config().readEntry(QStringLiteral("elevatePrivileges"), false));
     ui->offCpuCheckBox->setChecked(config().readEntry(QStringLiteral("offCpuProfiling"), false));
     ui->sampleCpuCheckBox->setChecked(config().readEntry(QStringLiteral("sampleCpu"), true));
-    ui->mmapPagesSpinBox->setValue(config().readEntry(QStringLiteral("mmapPages"), 0));
+    ui->mmapPagesSpinBox->setValue(config().readEntry(QStringLiteral("mmapPages"), 16));
     ui->mmapPagesUnitComboBox->setCurrentIndex(config().readEntry(QStringLiteral("mmapPagesUnit"), 2));
-    ui->useAioCheckBox->setChecked(config().readEntry(QStringLiteral("useAio"), PerfRecord::canUseAio()));
+    connect(m_recordHost, &RecordHost::perfCapabilitiesChanged, this,
+            [this](RecordHost::PerfCapabilities capabilities) {
+                ui->useAioCheckBox->setChecked(config().readEntry(QStringLiteral("useAio"), capabilities.canUseAio));
+            });
 
     const auto callGraph = config().readEntry("callGraph", ui->callGraphComboBox->currentData());
     const auto callGraphIdx = ui->callGraphComboBox->findData(callGraph);
     if (callGraphIdx != -1) {
         ui->callGraphComboBox->setCurrentIndex(callGraphIdx);
     }
-
-    updateOffCpuCheckboxState();
-
-    showRecordPage();
 
     m_updateRuntimeTimer->setInterval(1000);
     connect(m_updateRuntimeTimer, &QTimer::timeout, this, [this] {
@@ -420,12 +472,12 @@ RecordPage::RecordPage(QWidget* parent)
         ui->startRecordingButton->setText(tr("Stop Recording (%1)").arg(Util::formatTimeString(roundedElapsed, true)));
     });
 
-    auto* stopRecordingShortcut = new QShortcut(Qt::Key_Escape, this);
+    auto* stopRecordingShortcut = new QShortcut(tr("Escape"), this);
     stopRecordingShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(stopRecordingShortcut, &QShortcut::activated, this,
             [this] { ui->startRecordingButton->setChecked(false); });
 
-    auto* startRecordingShortcut = new QShortcut(Qt::CTRL + Qt::Key_Return, this);
+    auto* startRecordingShortcut = new QShortcut(tr("Ctrl+Return"), this);
     startRecordingShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(startRecordingShortcut, &QShortcut::activated, this, [this] {
         if (ui->viewPerfRecordResultsButton->isEnabled()) {
@@ -435,38 +487,9 @@ RecordPage::RecordPage(QWidget* parent)
         }
     });
 
-    if (!PerfRecord::canSampleCpu()) {
-        ui->sampleCpuCheckBox->hide();
-        ui->sampleCpuLabel->hide();
-    }
-    if (!PerfRecord::canSwitchEvents()) {
-        ui->offCpuCheckBox->hide();
-        ui->offCpuLabel->hide();
-    }
-    if (!PerfRecord::canUseAio()) {
-        ui->useAioCheckBox->hide();
-        ui->useAioLabel->hide();
-    }
-    if (!PerfRecord::canCompress()) {
-        ui->compressionComboBox->hide();
-        ui->compressionLabel->hide();
-    } else {
-        ui->compressionComboBox->addItem(tr("Disabled"), -1);
-        ui->compressionComboBox->addItem(tr("Enabled (Default Level)"), 0);
-        ui->compressionComboBox->addItem(tr("Level 1 (Fastest)"), 1);
-        for (int i = 2; i <= 21; ++i)
-            ui->compressionComboBox->addItem(tr("Level %1").arg(i), 0);
-        ui->compressionComboBox->addItem(tr("Level 22 (Slowest)"), 22);
+    showRecordPage();
 
-        ui->compressionComboBox->setCurrentIndex(1);
-        const auto defaultLevel = ui->compressionComboBox->currentData().toInt();
-        const auto level = config().readEntry(QStringLiteral("compressionLevel"), defaultLevel);
-        const auto index = ui->compressionComboBox->findData(level);
-        if (index != -1)
-            ui->compressionComboBox->setCurrentIndex(index);
-    }
-
-    addKonsoleWidget();
+    ui->applicationRecordWarningMessage->setVisible(false);
 }
 
 RecordPage::~RecordPage() = default;
@@ -491,10 +514,10 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
         ui->perfOptionsBox->setEnabled(false);
         ui->startRecordingButton->setIcon(QIcon::fromTheme(QStringLiteral("media-playback-stop")));
         ui->startRecordingButton->setText(tr("Stop Recording"));
-        ui->perfResultsTextEdit->clear();
+        m_perfOutput->clear();
+        ui->applicationRecordWarningMessage->hide();
 
-        // clear konsole
-        addKonsoleWidget();
+        auto perfCapabilities = m_recordHost->perfCapabilities();
 
         QStringList perfOptions;
 
@@ -520,7 +543,7 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
         perfOptions += KShell::splitArgs(customOptions);
 
         const bool offCpuProfilingEnabled = ui->offCpuCheckBox->isChecked();
-        if (offCpuProfilingEnabled && PerfRecord::canSwitchEvents()) {
+        if (offCpuProfilingEnabled && perfCapabilities.canSwitchEvents) {
             if (eventType.isEmpty()) {
                 // TODO: use clock event in VM context
                 perfOptions += QStringLiteral("--event");
@@ -531,13 +554,13 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
         config().writeEntry(QStringLiteral("offCpuProfiling"), offCpuProfilingEnabled);
 
         const bool useAioEnabled = ui->useAioCheckBox->isChecked();
-        if (useAioEnabled && PerfRecord::canUseAio()) {
+        if (useAioEnabled && perfCapabilities.canUseAio) {
             perfOptions += QStringLiteral("--aio");
         }
         config().writeEntry(QStringLiteral("useAio"), useAioEnabled);
 
         const auto compressionLevel = ui->compressionComboBox->currentData().toInt();
-        if (PerfRecord::canCompress() && compressionLevel >= 0) {
+        if (perfCapabilities.canCompress && compressionLevel >= 0) {
             if (compressionLevel == 0)
                 perfOptions += QStringLiteral("-z");
             else
@@ -548,11 +571,11 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
         const bool elevatePrivileges = ui->elevatePrivilegesCheckBox->isChecked();
 
         const bool sampleCpuEnabled = ui->sampleCpuCheckBox->isChecked();
-        if (sampleCpuEnabled && PerfRecord::canSampleCpu()) {
+        if (sampleCpuEnabled && perfCapabilities.canSampleCpu) {
             perfOptions += QStringLiteral("--sample-cpu");
         }
 
-        if (recordType != ProfileSystem) { // always true when recording full system
+        if (recordType != RecordType::ProfileSystem) { // always true when recording full system
             config().writeEntry(QStringLiteral("elevatePrivileges"), elevatePrivileges);
             config().writeEntry(QStringLiteral("sampleCpu"), sampleCpuEnabled);
         }
@@ -587,13 +610,13 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
         config().writeEntry(QStringLiteral("mmapPages"), mmapPages);
         config().writeEntry(QStringLiteral("mmapPagesUnit"), mmapPagesUnit);
 
-        const auto outputFile = ui->outputFile->url().toLocalFile();
+        const auto outputFile = m_recordHost->outputFileName();
 
         switch (recordType) {
-        case LaunchApplication: {
-            const auto applicationName = KShell::tildeExpand(ui->applicationName->text());
+        case RecordType::LaunchApplication: {
+            const auto applicationName = m_recordHost->clientApplication();
             const auto appParameters = ui->applicationParametersBox->text();
-            auto workingDir = ui->workingDirectory->text();
+            auto workingDir = m_recordHost->currentWorkingDirectory();
             if (workingDir.isEmpty()) {
                 workingDir = ui->workingDirectory->placeholderText();
             }
@@ -602,11 +625,12 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
                                  KShell::splitArgs(appParameters), workingDir);
             break;
         }
-        case AttachToProcess: {
+        case RecordType::AttachToProcess: {
             QItemSelectionModel* selectionModel = ui->processesTableView->selectionModel();
             QStringList pids;
 
-            for (const auto& item : selectionModel->selectedIndexes()) {
+            const auto selection = selectionModel->selectedIndexes();
+            for (const auto& item : selection) {
                 if (item.column() == 0) {
                     pids.append(item.data(ProcessModel::PIDRole).toString());
                 }
@@ -615,11 +639,11 @@ void RecordPage::onStartRecordingButtonClicked(bool checked)
             m_perfRecord->record(perfOptions, outputFile, elevatePrivileges, pids);
             break;
         }
-        case ProfileSystem: {
+        case RecordType::ProfileSystem: {
             m_perfRecord->recordSystem(perfOptions, outputFile);
             break;
         }
-        case NUM_RECORD_TYPES:
+        case RecordType::NUM_RECORD_TYPES:
             break;
         }
     } else {
@@ -639,93 +663,12 @@ void RecordPage::recordingStopped()
     ui->launchAppBox->setEnabled(true);
     ui->attachAppBox->setEnabled(true);
     ui->perfOptionsBox->setEnabled(true);
-    ui->perfInputEdit->setEnabled(false);
+    m_perfOutput->enableInput(false);
 }
 
 void RecordPage::stopRecording()
 {
     m_perfRecord->stopRecording();
-}
-
-void RecordPage::onApplicationNameChanged(const QString& filePath)
-{
-    QFileInfo application(KShell::tildeExpand(filePath));
-    if (!application.exists()) {
-        application.setFile(QStandardPaths::findExecutable(filePath));
-    }
-
-    if (!application.exists()) {
-        setError(tr("Application file cannot be found: %1").arg(filePath));
-    } else if (!application.isFile()) {
-        setError(tr("Application file is not valid: %1").arg(filePath));
-    } else if (!application.isExecutable()) {
-        setError(tr("Application file is not executable: %1").arg(filePath));
-    } else {
-        const auto config = applicationConfig(filePath);
-        ui->workingDirectory->setText(config.readEntry("workingDir", QString()));
-        ui->applicationParametersBox->setText(config.readEntry("params", QString()));
-        ui->workingDirectory->setPlaceholderText(application.path());
-        setError({});
-
-        m_multiConfig->setConfig(applicationConfig(ui->applicationName->text()));
-    }
-    updateStartRecordingButtonState(ui);
-}
-
-void RecordPage::onWorkingDirectoryNameChanged(const QString& folderPath)
-{
-    QFileInfo folder(ui->workingDirectory->url().toLocalFile());
-
-    if (!folder.exists()) {
-        setError(tr("Working directory folder cannot be found: %1").arg(folderPath));
-    } else if (!folder.isDir()) {
-        setError(tr("Working directory folder is not valid: %1").arg(folderPath));
-    } else if (!folder.isWritable()) {
-        setError(tr("Working directory folder is not writable: %1").arg(folderPath));
-    } else {
-        setError({});
-    }
-    updateStartRecordingButtonState(ui);
-}
-
-void RecordPage::onViewPerfRecordResultsButtonClicked()
-{
-    emit openFile(m_resultsFile);
-}
-
-void RecordPage::onOutputFileNameChanged(const QString& /*filePath*/)
-{
-    const auto perfDataExtension = QStringLiteral(".data");
-
-    QFileInfo file(ui->outputFile->url().toLocalFile());
-    QFileInfo folder(file.absolutePath());
-
-    if (!folder.exists()) {
-        setError(tr("Output file directory folder cannot be found: %1").arg(folder.path()));
-    } else if (!folder.isDir()) {
-        setError(tr("Output file directory folder is not valid: %1").arg(folder.path()));
-    } else if (!folder.isWritable()) {
-        setError(tr("Output file directory folder is not writable: %1").arg(folder.path()));
-    } else if (!file.absoluteFilePath().endsWith(perfDataExtension)) {
-        setError(tr("Output file must end with %1").arg(perfDataExtension));
-    } else {
-        setError({});
-    }
-    updateStartRecordingButtonState(ui);
-}
-
-void RecordPage::onOutputFileNameSelected(const QString& filePath)
-{
-    const auto perfDataExtension = QStringLiteral(".data");
-
-    if (!filePath.endsWith(perfDataExtension)) {
-        ui->outputFile->setText(filePath + perfDataExtension);
-    }
-}
-
-void RecordPage::onOutputFileUrlChanged(const QUrl& fileUrl)
-{
-    onOutputFileNameSelected(fileUrl.toLocalFile());
 }
 
 void RecordPage::updateProcesses()
@@ -735,35 +678,17 @@ void RecordPage::updateProcesses()
 
 void RecordPage::updateProcessesFinished()
 {
-    if (ui->startRecordingButton->isChecked()) {
+    if (ui->startRecordingButton->isChecked() || selectedRecordType(ui) != RecordType::AttachToProcess) {
         return;
     }
 
     m_processModel->mergeProcesses(m_watcher->result());
-
-    if (selectedRecordType(ui) == AttachToProcess) {
-        // only update the state when we show the attach app page
-        updateStartRecordingButtonState(ui);
-        QTimer::singleShot(1000, this, &RecordPage::updateProcesses);
-    }
+    QTimer::singleShot(1000, this, &RecordPage::updateProcesses);
 }
 
 void RecordPage::appendOutput(const QString& text)
 {
-    if (m_konsolePart) {
-        m_konsoleFile->write(text.toUtf8());
-        m_konsoleFile->flush();
-        return;
-    }
-
-    // this regex finds ansi escapes
-    static const QRegularExpression regex(QStringLiteral("\\x1b\\[[0-9;]+m"));
-
-    QTextCursor cursor(ui->perfResultsTextEdit->document());
-    cursor.movePosition(QTextCursor::End);
-
-    QString cleanOutput = text;
-    cursor.insertText(cleanOutput.replace(regex, QString()));
+    m_perfOutput->addOutput(text);
 }
 
 void RecordPage::setError(const QString& message)
@@ -772,95 +697,18 @@ void RecordPage::setError(const QString& message)
     ui->applicationRecordErrorMessage->setVisible(!message.isEmpty());
 }
 
-void RecordPage::addKonsoleWidget()
-{
-    KService::Ptr service = KService::serviceByDesktopName(QStringLiteral("konsolepart"));
-
-    if (!service) {
-        return;
-    }
-
-    const auto tail = QStandardPaths::findExecutable(QStringLiteral("tail"));
-
-    if (tail.isEmpty()) {
-        return;
-    }
-
-    if (m_konsolePart) {
-        ui->recordOutputBox->layout()->removeWidget(m_konsolePart->widget());
-        m_konsolePart->deleteLater();
-    }
-    m_konsolePart = service->createInstance<KParts::ReadOnlyPart>(this);
-
-    if (!m_konsolePart) {
-        return;
-    }
-
-    const auto terminalInterface = qobject_cast<TerminalInterface*>(m_konsolePart);
-    if (!terminalInterface) {
-        qWarning("konsole kpart doesn't implement terminal interface");
-        delete m_konsolePart;
-        m_konsolePart = nullptr;
-        return;
-    }
-
-    if (m_konsoleFile) {
-        m_konsoleFile->deleteLater();
-    }
-    m_konsoleFile = new QTemporaryFile(this);
-    m_konsoleFile->open();
-
-    terminalInterface->startProgram(tail, {tail, QStringLiteral("-f"), m_konsoleFile->fileName()});
-    ui->recordOutputBoxLayout->insertWidget(1, m_konsolePart->widget());
-    ui->perfResultsTextEdit->setVisible(false);
-
-    m_konsolePart->widget()->setFocusPolicy(Qt::FocusPolicy::NoFocus);
-}
-
 void RecordPage::updateRecordType()
 {
     setError({});
 
     const auto recordType = selectedRecordType(ui);
-    ui->launchAppBox->setVisible(recordType == LaunchApplication);
-    ui->attachAppBox->setVisible(recordType == AttachToProcess);
-    ui->perfInputEdit->setVisible(recordType == LaunchApplication);
-    ui->perfInputEdit->clear();
-    ui->perfResultsTextEdit->clear();
-    ui->elevatePrivilegesCheckBox->setEnabled(recordType != ProfileSystem);
-    ui->sampleCpuCheckBox->setEnabled(recordType != ProfileSystem && PerfRecord::canSampleCpu());
-    if (recordType == ProfileSystem) {
-        ui->elevatePrivilegesCheckBox->setChecked(true);
-        ui->sampleCpuCheckBox->setChecked(true && PerfRecord::canSampleCpu());
-    }
+    ui->launchAppBox->setVisible(recordType == RecordType::LaunchApplication);
+    ui->attachAppBox->setVisible(recordType == RecordType::AttachToProcess);
 
-    if (recordType == AttachToProcess) {
+    m_perfOutput->setInputVisible(recordType == RecordType::LaunchApplication);
+    m_perfOutput->clear();
+
+    if (recordType == RecordType::AttachToProcess) {
         updateProcesses();
-    }
-
-    // clear konsole
-    addKonsoleWidget();
-
-    updateStartRecordingButtonState(ui);
-}
-
-void RecordPage::updateOffCpuCheckboxState()
-{
-    const bool enableOffCpuProfiling =
-        (ui->elevatePrivilegesCheckBox->isChecked() || PerfRecord::canProfileOffCpu()) && PerfRecord::canSwitchEvents();
-
-    if (enableOffCpuProfiling == ui->offCpuCheckBox->isEnabled()) {
-        return;
-    }
-
-    ui->offCpuCheckBox->setEnabled(enableOffCpuProfiling);
-
-    // prevent user confusion: don't show the value as checked when the checkbox is disabled
-    if (!enableOffCpuProfiling) {
-        // remember the current value
-        config().writeEntry(QStringLiteral("offCpuProfiling"), ui->offCpuCheckBox->isChecked());
-        ui->offCpuCheckBox->setChecked(false);
-    } else {
-        ui->offCpuCheckBox->setChecked(config().readEntry(QStringLiteral("offCpuProfiling"), false));
     }
 }

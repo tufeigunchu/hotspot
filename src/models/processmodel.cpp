@@ -1,29 +1,9 @@
 /*
-  processmodel.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Authors: Milian Wolff <milian.wolff@kdab.com>
-           Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "processmodel.h"
@@ -37,7 +17,7 @@ ProcessModel::ProcessModel(QObject* parent)
 {
 }
 
-ProcessModel::~ProcessModel() { }
+ProcessModel::~ProcessModel() = default;
 
 void ProcessModel::setProcesses(const ProcDataList& processes)
 {
@@ -119,13 +99,14 @@ QModelIndex ProcessModel::indexForPid(const QString& pid) const
         if (m_data.at(i).ppid == pid)
             return index(i, 0);
     }
-    return QModelIndex();
+
+    return {};
 }
 
 QVariant ProcessModel::headerData(int section, Qt::Orientation orientation, int role) const
 {
     if (role != Qt::DisplayRole || orientation != Qt::Horizontal)
-        return QVariant();
+        return {};
 
     if (section == PIDColumn)
         return tr("Process ID");
@@ -136,13 +117,13 @@ QVariant ProcessModel::headerData(int section, Qt::Orientation orientation, int 
     else if (section == UserColumn)
         return tr("User");
 
-    return QVariant();
+    return {};
 }
 
 QVariant ProcessModel::data(const QModelIndex& index, int role) const
 {
     if (!index.isValid())
-        return QVariant();
+        return {};
 
     const ProcData& data = m_data.at(index.row());
 
@@ -167,7 +148,7 @@ QVariant ProcessModel::data(const QModelIndex& index, int role) const
         return data.user;
     }
 
-    return QVariant();
+    return {};
 }
 
 int ProcessModel::columnCount(const QModelIndex& parent) const
@@ -183,10 +164,4 @@ int ProcessModel::rowCount(const QModelIndex& parent) const
 ProcDataList ProcessModel::processes() const
 {
     return m_data;
-}
-
-Qt::ItemFlags ProcessModel::flags(const QModelIndex& index) const
-{
-    const Qt::ItemFlags f = QAbstractItemModel::flags(index);
-    return f;
 }

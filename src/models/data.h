@@ -1,28 +1,8 @@
 /*
-  data.h
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
@@ -36,7 +16,6 @@
 
 #include "../util.h"
 
-#include <functional>
 #include <limits>
 #include <tuple>
 #include <valarray>
@@ -46,8 +25,8 @@ QString prettifySymbol(const QString& symbol);
 
 struct Symbol
 {
-    Symbol(const QString& symbol = {}, const quint64& relAddr = 0, const quint64& size = 0, const QString& binary = {},
-           const QString& path = {}, const QString& actualPath = {}, bool isKernel = false)
+    Symbol(const QString& symbol = {}, quint64 relAddr = 0, quint64 size = 0, const QString& binary = {},
+           const QString& path = {}, const QString& actualPath = {}, bool isKernel = false, bool isInline = false)
         : symbol(symbol)
         , prettySymbol(Data::prettifySymbol(symbol))
         , relAddr(relAddr)
@@ -56,6 +35,7 @@ struct Symbol
         , path(path)
         , actualPath(actualPath)
         , isKernel(isKernel)
+        , isInline(isInline)
     {
     }
 
@@ -74,6 +54,7 @@ struct Symbol
     // actual file path
     QString actualPath;
     bool isKernel = false;
+    bool isInline = false;
 
     bool operator<(const Symbol& rhs) const
     {
@@ -84,13 +65,19 @@ struct Symbol
     {
         return !symbol.isEmpty() || !binary.isEmpty() || !path.isEmpty();
     }
+
+    bool canDisassemble() const
+    {
+        return !symbol.isEmpty() && !path.isEmpty() && relAddr > 0 && size > 0 && !isInline;
+    }
 };
 
 QDebug operator<<(QDebug stream, const Symbol& symbol);
 
 inline bool operator==(const Symbol& lhs, const Symbol& rhs)
 {
-    return std::tie(lhs.symbol, lhs.binary, lhs.path) == std::tie(rhs.symbol, rhs.binary, rhs.path);
+    return std::tie(lhs.relAddr, lhs.symbol, lhs.binary, lhs.path)
+        == std::tie(rhs.relAddr, rhs.symbol, rhs.binary, rhs.path);
 }
 
 inline bool operator!=(const Symbol& lhs, const Symbol& rhs)
@@ -104,27 +91,82 @@ inline uint qHash(const Symbol& symbol, uint seed = 0)
     seed = hash(seed, symbol.symbol);
     seed = hash(seed, symbol.binary);
     seed = hash(seed, symbol.path);
+    seed = hash(seed, symbol.relAddr);
+    return seed;
+}
+
+struct FileLine
+{
+    FileLine() = default;
+    FileLine(const QString& file, int line)
+        : file(file)
+        , line(line)
+    {
+    }
+
+    bool isValid() const
+    {
+        return !file.isEmpty();
+    }
+
+    QString toString() const
+    {
+        return file + QLatin1Char(':') + QString::number(line);
+    }
+
+    QString toShortString() const
+    {
+        auto slashIdx = file.lastIndexOf(QLatin1Char('/')) + 1;
+        return QStringView(file).mid(slashIdx) + QLatin1Char(':') + QString::number(line);
+    }
+
+    QString file;
+    int line = -1;
+
+    bool operator<(const FileLine& rhs) const
+    {
+        return std::tie(file, line) < std::tie(rhs.file, rhs.line);
+    }
+};
+
+QDebug operator<<(QDebug stream, const FileLine& fileLine);
+
+inline bool operator==(const FileLine& lhs, const FileLine& rhs)
+{
+    return std::tie(lhs.file, lhs.line) == std::tie(rhs.file, rhs.line);
+}
+
+inline bool operator!=(const FileLine& lhs, const FileLine& rhs)
+{
+    return !(lhs == rhs);
+}
+
+inline uint qHash(const FileLine& fileLine, uint seed = 0)
+{
+    Util::HashCombine hash;
+    seed = hash(seed, fileLine.file);
+    seed = hash(seed, fileLine.line);
     return seed;
 }
 
 struct Location
 {
-    Location(quint64 address = 0, quint64 relAddr = 0, const QString& location = {})
+    Location() = default;
+    Location(quint64 address, quint64 relAddr, FileLine fileLine)
         : address(address)
         , relAddr(relAddr)
-        , location(location)
+        , fileLine(std::move(fileLine))
     {
     }
 
     quint64 address = 0;
-    // relative address
+    // relative address, might be 0 for locations in the main executable
     quint64 relAddr = 0;
-    // file + line
-    QString location;
+    FileLine fileLine;
 
     bool operator<(const Location& rhs) const
     {
-        return std::tie(address, relAddr, location) < std::tie(rhs.address, rhs.relAddr, rhs.location);
+        return std::tie(address, relAddr, fileLine) < std::tie(rhs.address, rhs.relAddr, fileLine);
     }
 };
 
@@ -132,7 +174,7 @@ QDebug operator<<(QDebug stream, const Location& location);
 
 inline bool operator==(const Location& lhs, const Location& rhs)
 {
-    return std::tie(lhs.address, lhs.relAddr, lhs.location) == std::tie(rhs.address, rhs.relAddr, rhs.location);
+    return std::tie(lhs.address, lhs.relAddr, lhs.fileLine) == std::tie(rhs.address, rhs.relAddr, rhs.fileLine);
 }
 
 inline bool operator!=(const Location& lhs, const Location& rhs)
@@ -145,7 +187,7 @@ inline uint qHash(const Location& location, uint seed = 0)
     Util::HashCombine hash;
     seed = hash(seed, location.address);
     seed = hash(seed, location.relAddr);
-    seed = hash(seed, location.location);
+    seed = hash(seed, location.fileLine);
     return seed;
 }
 
@@ -171,6 +213,7 @@ public:
     enum class Unit
     {
         Unknown,
+        Tracepoint,
         Time
     };
 
@@ -287,6 +330,7 @@ public:
         switch (unit) {
         case Unit::Time:
             return Util::formatTimeString(cost);
+        case Unit::Tracepoint:
         case Unit::Unknown:
             break;
         }
@@ -407,13 +451,33 @@ struct BottomUpResults
 
     // callback return type is ignored, all frames will be iterated over
     template<typename FrameCallback>
-    const BottomUp* addEvent(int type, quint64 cost, const QVector<qint32>& frames, FrameCallback frameCallback)
+    const BottomUp* addEvent(int type, quint64 cost, const QVector<qint32>& frames, const FrameCallback& frameCallback)
     {
         costs.addTotalCost(type, cost);
         auto parent = &root;
         foreachFrame(
             frames,
-            [this, type, cost, &parent, frameCallback](const Data::Symbol& symbol, const Data::Location& location) {
+            [this, type, cost, &parent, &frameCallback](const Data::Symbol& symbol, const Data::Location& location) {
+                parent = parent->entryForSymbol(symbol, &maxBottomUpId);
+                costs.add(type, parent->id, cost);
+                frameCallback(symbol, location);
+                return true;
+            });
+        return parent;
+    }
+
+    template<typename FrameCallback>
+    const BottomUp* addEvent(const Symbol& rootSymbol, int type, quint64 cost, const QVector<qint32>& frames,
+                             const FrameCallback& frameCallback)
+    {
+        auto parent = root.entryForSymbol(rootSymbol, &maxBottomUpId);
+
+        // propagate cost to rootSymbol
+        costs.add(type, parent->id, cost);
+        costs.addTotalCost(type, cost);
+        foreachFrame(
+            frames,
+            [this, type, cost, &parent, &frameCallback](const Data::Symbol& symbol, const Data::Location& location) {
                 parent = parent->entryForSymbol(symbol, &maxBottomUpId);
                 costs.add(type, parent->id, cost);
                 frameCallback(symbol, location);
@@ -424,6 +488,7 @@ struct BottomUpResults
 
 private:
     quint32 maxBottomUpId = 0;
+    QHash<quint32, BottomUp*> tidToBottomUp;
 
     template<typename FrameCallback>
     bool handleFrame(qint32 locationId, FrameCallback frameCallback) const
@@ -465,7 +530,42 @@ struct TopDownResults
     TopDown root;
     Costs selfCosts;
     Costs inclusiveCosts;
-    static TopDownResults fromBottomUp(const Data::BottomUpResults& bottomUpData);
+    static TopDownResults fromBottomUp(const Data::BottomUpResults& bottomUpData, bool skipFirstLevel);
+};
+
+struct PerLibrary : SymbolTree<PerLibrary>
+{
+    quint32 id = 0;
+};
+
+struct PerLibraryResults
+{
+    PerLibrary root;
+    Costs costs;
+
+    static PerLibraryResults fromTopDown(const TopDownResults& topDownData);
+};
+
+struct FrequencyData
+{
+    quint64 time = 0;
+    double cost = 0;
+};
+
+struct PerCostFrequencyData
+{
+    QString costName;
+    QVector<FrequencyData> values;
+};
+
+struct PerCoreFrequencyData
+{
+    QVector<PerCostFrequencyData> costs;
+};
+
+struct FrequencyResults
+{
+    QVector<PerCoreFrequencyData> cores;
 };
 
 using SymbolCostMap = QHash<Symbol, ItemCost>;
@@ -484,18 +584,18 @@ struct LocationCost
     ItemCost inclusiveCost;
 };
 
-using SourceLocationCostMap = QHash<QString, LocationCost>;
+using SourceLocationCostMap = QHash<FileLine, LocationCost>;
 using OffsetLocationCostMap = QHash<quint64, LocationCost>;
 
 struct CallerCalleeEntry
 {
     quint32 id = 0;
 
-    LocationCost& source(const QString& location, int numTypes)
+    LocationCost& source(const FileLine& fileLine, int numTypes)
     {
-        auto it = sourceMap.find(location);
+        auto it = sourceMap.find(fileLine);
         if (it == sourceMap.end()) {
-            it = sourceMap.insert(location, {numTypes});
+            it = sourceMap.insert(fileLine, {numTypes});
         } else if (it->inclusiveCost.size() < static_cast<size_t>(numTypes)) {
             it->inclusiveCost.resize(numTypes);
             it->selfCost.resize(numTypes);
@@ -503,11 +603,11 @@ struct CallerCalleeEntry
         return *it;
     }
 
-    LocationCost& offset(quint64 location, int numTypes)
+    LocationCost& offset(quint64 addr, int numTypes)
     {
-        auto it = offsetMap.find(location);
+        auto it = offsetMap.find(addr);
         if (it == offsetMap.end()) {
-            it = offsetMap.insert(location, {numTypes});
+            it = offsetMap.insert(addr, {numTypes});
         } else if (it->inclusiveCost.size() < static_cast<size_t>(numTypes)) {
             it->inclusiveCost.resize(numTypes);
             it->selfCost.resize(numTypes);
@@ -623,12 +723,12 @@ struct TimeRange
         return *this;
     }
 
-    bool operator==(const TimeRange& rhs) const
+    bool operator==(TimeRange rhs) const
     {
         return std::tie(start, end) == std::tie(rhs.start, rhs.end);
     }
 
-    bool operator!=(const TimeRange& rhs) const
+    bool operator!=(TimeRange rhs) const
     {
         return !operator==(rhs);
     }
@@ -699,7 +799,7 @@ QDebug operator<<(QDebug stream, const CostSummary& symbol);
 
 struct Summary
 {
-    quint64 applicationRunningTime = 0;
+    TimeRange applicationTime;
     quint32 threadCount = 0;
     quint32 processCount = 0;
     QString command;
@@ -727,6 +827,11 @@ struct Summary
     QStringList errors;
 };
 
+struct ThreadNames
+{
+    QHash<qint32, QHash<qint32, QString>> names;
+};
+
 struct EventResults
 {
     QVector<ThreadEvents> threads;
@@ -746,6 +851,17 @@ struct EventResults
     }
 };
 
+struct Tracepoint
+{
+    quint64 time = 0;
+    QString name;
+};
+
+struct TracepointResults
+{
+    QVector<Tracepoint> tracepoints;
+};
+
 struct FilterAction
 {
     TimeRange time;
@@ -757,12 +873,15 @@ struct FilterAction
     QVector<quint32> excludeCpuIds;
     QSet<Data::Symbol> includeSymbols;
     QSet<Data::Symbol> excludeSymbols;
+    QSet<QString> includeBinaries;
+    QSet<QString> excludeBinaries;
 
     bool isValid() const
     {
         return time.isValid() || processId != INVALID_PID || threadId != INVALID_PID || cpuId != INVALID_CPU_ID
             || !excludeProcessIds.isEmpty() || !excludeThreadIds.isEmpty() || !excludeCpuIds.isEmpty()
-            || !includeSymbols.isEmpty() || !excludeSymbols.isEmpty();
+            || !includeSymbols.isEmpty() || !excludeSymbols.isEmpty() || !includeBinaries.isEmpty()
+            || !excludeBinaries.isEmpty();
     }
 };
 
@@ -779,6 +898,9 @@ struct ZoomAction
 
 Q_DECLARE_METATYPE(Data::Symbol)
 Q_DECLARE_TYPEINFO(Data::Symbol, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::FileLine)
+Q_DECLARE_TYPEINFO(Data::FileLine, Q_MOVABLE_TYPE);
 
 Q_DECLARE_METATYPE(Data::Location)
 Q_DECLARE_TYPEINFO(Data::Location, Q_MOVABLE_TYPE);
@@ -807,11 +929,26 @@ Q_DECLARE_TYPEINFO(Data::BottomUpResults, Q_MOVABLE_TYPE);
 Q_DECLARE_METATYPE(Data::TopDownResults)
 Q_DECLARE_TYPEINFO(Data::TopDownResults, Q_MOVABLE_TYPE);
 
+Q_DECLARE_METATYPE(Data::PerLibraryResults)
+Q_DECLARE_TYPEINFO(Data::PerLibraryResults, Q_MOVABLE_TYPE);
+
 Q_DECLARE_METATYPE(Data::CallerCalleeResults)
 Q_DECLARE_TYPEINFO(Data::CallerCalleeResults, Q_MOVABLE_TYPE);
 
 Q_DECLARE_METATYPE(Data::Event)
 Q_DECLARE_TYPEINFO(Data::Event, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::FrequencyData)
+Q_DECLARE_TYPEINFO(Data::FrequencyData, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::PerCostFrequencyData)
+Q_DECLARE_TYPEINFO(Data::PerCostFrequencyData, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::PerCoreFrequencyData)
+Q_DECLARE_TYPEINFO(Data::PerCoreFrequencyData, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::FrequencyResults)
+Q_DECLARE_TYPEINFO(Data::FrequencyResults, Q_MOVABLE_TYPE);
 
 Q_DECLARE_METATYPE(Data::ThreadEvents)
 Q_DECLARE_TYPEINFO(Data::ThreadEvents, Q_MOVABLE_TYPE);
@@ -825,8 +962,17 @@ Q_DECLARE_TYPEINFO(Data::Summary, Q_MOVABLE_TYPE);
 Q_DECLARE_METATYPE(Data::CostSummary)
 Q_DECLARE_TYPEINFO(Data::CostSummary, Q_MOVABLE_TYPE);
 
+Q_DECLARE_METATYPE(Data::ThreadNames)
+Q_DECLARE_TYPEINFO(Data::ThreadNames, Q_MOVABLE_TYPE);
+
 Q_DECLARE_METATYPE(Data::EventResults)
 Q_DECLARE_TYPEINFO(Data::EventResults, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::Tracepoint)
+Q_DECLARE_TYPEINFO(Data::Tracepoint, Q_MOVABLE_TYPE);
+
+Q_DECLARE_METATYPE(Data::TracepointResults)
+Q_DECLARE_TYPEINFO(Data::TracepointResults, Q_MOVABLE_TYPE);
 
 Q_DECLARE_METATYPE(Data::TimeRange)
 Q_DECLARE_TYPEINFO(Data::TimeRange, Q_MOVABLE_TYPE);

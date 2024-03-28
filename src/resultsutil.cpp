@@ -1,28 +1,9 @@
 /*
-  resultsutil.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "resultsutil.h"
@@ -32,23 +13,24 @@
 #include <QHeaderView>
 #include <QLineEdit>
 #include <QMenu>
+#include <QRegularExpression>
 #include <QSortFilterProxyModel>
 #include <QTimer>
 #include <QTreeView>
-
-#include <KLocalizedString>
 
 #include "models/costdelegate.h"
 #include "models/data.h"
 #include "models/filterandzoomstack.h"
 
+#include "costcontextmenu.h"
 #include "costheaderview.h"
+#include "settings.h"
 
 namespace ResultsUtil {
 
-void setupHeaderView(QTreeView* view)
+void setupHeaderView(QTreeView* view, CostContextMenu* contextMenu)
 {
-    view->setHeader(new CostHeaderView(view));
+    view->setHeader(new CostHeaderView(contextMenu, view));
 }
 
 void connectFilter(QLineEdit* filter, QSortFilterProxyModel* proxy)
@@ -62,19 +44,20 @@ void connectFilter(QLineEdit* filter, QSortFilterProxyModel* proxy)
     proxy->setFilterKeyColumn(-1);
     proxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
 
-    QObject::connect(timer, &QTimer::timeout, proxy,
-                     [filter, proxy]() { proxy->setFilterFixedString(filter->text()); });
+    QObject::connect(timer, &QTimer::timeout, proxy, [filter, proxy]() {
+        proxy->setFilterRegularExpression(QRegularExpression::escape(filter->text()));
+    });
     QObject::connect(filter, &QLineEdit::textChanged, timer, [timer]() { timer->start(300); });
 }
 
-void setupTreeView(QTreeView* view, QLineEdit* filter, QSortFilterProxyModel* model, int initialSortColumn,
-                   int sortRole)
+void setupTreeView(QTreeView* view, CostContextMenu* contextMenu, QLineEdit* filter, QSortFilterProxyModel* model,
+                   int initialSortColumn, int sortRole)
 {
     model->setSortRole(sortRole);
     connectFilter(filter, model);
 
     view->setModel(model);
-    setupHeaderView(view);
+    setupHeaderView(view, contextMenu);
     view->sortByColumn(initialSortColumn, Qt::DescendingOrder);
 }
 
@@ -82,23 +65,45 @@ void addFilterActions(QMenu* menu, const Data::Symbol& symbol, FilterAndZoomStac
 {
     if (symbol.isValid()) {
         auto filterActions = filterStack->actions();
-        filterActions.filterInBySymbol->setData(QVariant::fromValue(symbol));
-        filterActions.filterOutBySymbol->setData(filterActions.filterInBySymbol->data());
 
-        menu->addAction(filterActions.filterInBySymbol);
-        menu->addAction(filterActions.filterOutBySymbol);
-        menu->addSeparator();
+        // don't include symbol-related entries for binary-only symbols (like in Top Hotspots Per File)
+        if (!symbol.symbol.isEmpty()) {
+            auto symbolFilter = QVariant::fromValue(symbol);
+
+            filterActions.filterInBySymbol->setData(symbolFilter);
+            filterActions.filterOutBySymbol->setData(symbolFilter);
+
+            menu->addAction(filterActions.filterInBySymbol);
+            menu->addAction(filterActions.filterOutBySymbol);
+            menu->addSeparator();
+        }
+
+        // don't include binary-related entries when we don't have this information
+        if (!symbol.binary.isEmpty()) {
+            auto binaryFilter = QVariant::fromValue(symbol.binary);
+
+            filterActions.filterInByBinary->setData(binaryFilter);
+            filterActions.filterOutByBinary->setData(binaryFilter);
+
+            menu->addAction(filterActions.filterInByBinary);
+            menu->addAction(filterActions.filterOutByBinary);
+            menu->addSeparator();
+        }
     }
 
     menu->addAction(filterStack->actions().filterOut);
     menu->addAction(filterStack->actions().resetFilter);
 }
 
-void setupContextMenu(QTreeView* view, int symbolRole, FilterAndZoomStack* filterStack, CallbackActions actions,
-                      std::function<void(CallbackAction action, const Data::Symbol&)> callback)
+void setupContextMenu(QTreeView* view, CostContextMenu* costContextMenu, int symbolRole,
+                      FilterAndZoomStack* filterStack, CallbackActions actions,
+                      const std::function<void(CallbackAction action, const Data::Symbol&)>& callback)
 {
+    QObject::connect(costContextMenu, &CostContextMenu::hiddenColumnsChanged, view,
+                     [view, costContextMenu] { costContextMenu->hideColumns(view); });
+
     view->setContextMenuPolicy(Qt::CustomContextMenu);
-    QObject::connect(view, &QTreeView::customContextMenuRequested, view, [=](const QPoint& point) {
+    QObject::connect(view, &QTreeView::customContextMenuRequested, view, [=](QPoint point) {
         const auto index = view->indexAt(point);
         const auto symbol = index.data(symbolRole).value<Data::Symbol>();
 
@@ -109,19 +114,27 @@ void setupContextMenu(QTreeView* view, int symbolRole, FilterAndZoomStack* filte
                     contextMenu.addAction(QCoreApplication::translate("Util", "View Caller/Callee"));
                 QObject::connect(viewCallerCallee, &QAction::triggered, &contextMenu,
                                  [symbol, callback]() { callback(CallbackAction::ViewCallerCallee, symbol); });
+                viewCallerCallee->setEnabled(symbol.canDisassemble());
             }
             if (actions.testFlag(CallbackAction::OpenEditor)) {
                 auto* openEditorAction = contextMenu.addAction(QCoreApplication::translate("Util", "Open in Editor"));
                 QObject::connect(openEditorAction, &QAction::triggered, &contextMenu,
                                  [symbol, callback]() { callback(CallbackAction::OpenEditor, symbol); });
+                openEditorAction->setEnabled(symbol.canDisassemble());
             }
             if (actions.testFlag(CallbackAction::ViewDisassembly)) {
                 auto* viewDisassembly = contextMenu.addAction(QCoreApplication::translate("Util", "Disassembly"));
                 QObject::connect(viewDisassembly, &QAction::triggered, &contextMenu,
                                  [symbol, callback]() { callback(CallbackAction::ViewDisassembly, symbol); });
+                viewDisassembly->setEnabled(symbol.canDisassemble());
             }
             contextMenu.addSeparator();
         }
+
+        costContextMenu->addToMenu(view->header(),
+                                   contextMenu.addMenu(QCoreApplication::translate("Util", "Visible Columns")));
+        contextMenu.addSeparator();
+
         addFilterActions(&contextMenu, symbol, filterStack);
 
         if (!contextMenu.actions().isEmpty()) {
@@ -158,7 +171,21 @@ void hideEmptyColumns(const Data::Costs& costs, QTreeView* view, int numBaseColu
     }
 }
 
-void fillEventSourceComboBox(QComboBox* combo, const Data::Costs& costs, const KLocalizedString& tooltipTemplate)
+void hideTracepointColumns(const Data::Costs& costs, QTreeView* view, int numBaseColumns)
+{
+    for (int i = 0, c = costs.numTypes(); i < c; i++) {
+        const auto unit = costs.unit(i);
+        switch (unit) {
+        case Data::Costs::Unit::Time:
+        case Data::Costs::Unit::Tracepoint:
+            view->hideColumn(numBaseColumns + i);
+        case Data::Costs::Unit::Unknown:
+            break;
+        }
+    }
+}
+
+void fillEventSourceComboBox(QComboBox* combo, const Data::Costs& costs, const QString& tooltipTemplate)
 {
     // restore selection if possible
     const auto oldData = combo->currentData();
@@ -170,12 +197,60 @@ void fillEventSourceComboBox(QComboBox* combo, const Data::Costs& costs, const K
         }
         const auto& typeName = costs.typeName(i);
         combo->addItem(typeName, QVariant::fromValue(i));
-        combo->setItemData(i, tooltipTemplate.subs(typeName).toString(), Qt::ToolTipRole);
+        combo->setItemData(i, tooltipTemplate.arg(typeName), Qt::ToolTipRole);
     }
 
     const auto index = combo->findData(oldData);
     if (index != -1) {
         combo->setCurrentIndex(index);
     }
+}
+
+void setupResultsAggregation(QComboBox* costAggregationComboBox)
+{
+    struct AggregationType
+    {
+        QString name;
+        QString tooltip;
+        Settings::CostAggregation aggregation;
+    };
+
+    const AggregationType types[] = {
+        {QCoreApplication::translate("Util", "Symbol"),
+         QCoreApplication::translate("Util",
+                                     "Disable grouping and aggregate costs over all threads, processes and CPUs."),
+         Settings::CostAggregation::BySymbol},
+        {QCoreApplication::translate("Util", "Thread"),
+         QCoreApplication::translate("Util",
+                                     "Group events by thread id and aggregate costs separately for each thread."),
+         Settings::CostAggregation::ByThread},
+        {QCoreApplication::translate("Util", "Process"),
+         QCoreApplication::translate("Util",
+                                     "Group events by process id and aggregate costs separately for each process."),
+         Settings::CostAggregation::ByProcess},
+        {QCoreApplication::translate("Util", "CPU"),
+         QCoreApplication::translate("Util", "Group events by CPU id and aggregate costs separately for each CPU."),
+         Settings::CostAggregation::ByCPU}};
+    for (const auto& aggregationType : types) {
+        costAggregationComboBox->addItem(aggregationType.name, QVariant::fromValue(aggregationType.aggregation));
+        costAggregationComboBox->setItemData(costAggregationComboBox->count() - 1, aggregationType.tooltip,
+                                             Qt::ToolTipRole);
+    }
+
+    auto updateCostAggregation = [costAggregationComboBox](Settings::CostAggregation costAggregation) {
+        auto idx = costAggregationComboBox->findData(QVariant::fromValue(costAggregation));
+        Q_ASSERT(idx != -1);
+        costAggregationComboBox->setCurrentIndex(idx);
+    };
+    updateCostAggregation(Settings::instance()->costAggregation());
+    QObject::connect(Settings::instance(), &Settings::costAggregationChanged, costAggregationComboBox,
+                     updateCostAggregation);
+
+    QObject::connect(costAggregationComboBox, qOverload<int>(&QComboBox::currentIndexChanged), Settings::instance(),
+                     [costAggregationComboBox] {
+                         const auto aggregation =
+                             costAggregationComboBox->currentData().value<Settings::CostAggregation>();
+                         Settings::instance()->setCostAggregation(aggregation);
+                     });
 }
 }

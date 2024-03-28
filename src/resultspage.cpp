@@ -1,35 +1,18 @@
 /*
-  resultspage.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "resultspage.h"
 #include "ui_resultspage.h"
 
 #include "parsers/perf/perfparser.h"
+#include "settings.h"
 
+#include "costcontextmenu.h"
 #include "dockwidgetsetup.h"
 #include "resultsbottomuppage.h"
 #include "resultscallercalleepage.h"
@@ -37,7 +20,6 @@
 #include "resultsflamegraphpage.h"
 #include "resultssummarypage.h"
 #include "resultstopdownpage.h"
-#include "resultsutil.h"
 
 #include "timelinewidget.h"
 
@@ -45,8 +27,15 @@
 
 #include <KLocalizedString>
 
+#include <kddockwidgets/kddockwidgets_version.h>
+
+#if KDDOCKWIDGETS_VERSION < KDDOCKWIDGETS_VERSION_CHECK(2, 0, 0)
 #include <kddockwidgets/DockWidget.h>
 #include <kddockwidgets/MainWindow.h>
+#else
+#include <kddockwidgets/qtwidgets/DockWidget.h>
+#include <kddockwidgets/qtwidgets/MainWindow.h>
+#endif // KDDOCKWIDGETS_VERSION < KDDOCKWIDGETS_VERSION_CHECK(2, 0, 0)
 
 #include <QDebug>
 #include <QLabel>
@@ -54,20 +43,48 @@
 #include <QProgressBar>
 #include <QTimer>
 
+#include "hotspot-config.h"
+#if QCustomPlot_FOUND
+#include "frequencypage.h"
+#endif
+
+namespace {
+void showDock(DockWidget* dock)
+{
+    dock->show();
+    dock->setFocus(Qt::FocusReason::NoFocusReason);
+    dock->setAsCurrentTab();
+}
+
+CoreDockWidget* toDockWidget(DockWidget* dock)
+{
+#if KDDOCKWIDGETS_VERSION < KDDOCKWIDGETS_VERSION_CHECK(2, 0, 0)
+    return dock;
+#else
+    return dock->dockWidget();
+#endif //  KDDOCKWIDGETS_VERSION < KDDOCKWIDGETS_VERSION_CHECK
+}
+}
+
 ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
     : QWidget(parent)
-    , ui(new Ui::ResultsPage)
+    , ui(std::make_unique<Ui::ResultsPage>())
     , m_contents(createDockingArea(QStringLiteral("results"), this))
     , m_filterAndZoomStack(new FilterAndZoomStack(this))
+    , m_costContextMenu(new CostContextMenu(this))
     , m_filterMenu(new QMenu(this))
     , m_exportMenu(new QMenu(tr("Export"), this))
-    , m_resultsSummaryPage(new ResultsSummaryPage(m_filterAndZoomStack, parser, this))
-    , m_resultsBottomUpPage(new ResultsBottomUpPage(m_filterAndZoomStack, parser, m_exportMenu, this))
-    , m_resultsTopDownPage(new ResultsTopDownPage(m_filterAndZoomStack, parser, this))
+    , m_resultsSummaryPage(new ResultsSummaryPage(m_filterAndZoomStack, parser, m_costContextMenu, this))
+    , m_resultsBottomUpPage(
+          new ResultsBottomUpPage(m_filterAndZoomStack, parser, m_costContextMenu, m_exportMenu, this))
+    , m_resultsTopDownPage(new ResultsTopDownPage(m_filterAndZoomStack, parser, m_costContextMenu, this))
     , m_resultsFlameGraphPage(new ResultsFlameGraphPage(m_filterAndZoomStack, parser, m_exportMenu, this))
-    , m_resultsCallerCalleePage(new ResultsCallerCalleePage(m_filterAndZoomStack, parser, this))
-    , m_resultsDisassemblyPage(new ResultsDisassemblyPage(this))
+    , m_resultsCallerCalleePage(new ResultsCallerCalleePage(m_filterAndZoomStack, parser, m_costContextMenu, this))
+    , m_resultsDisassemblyPage(new ResultsDisassemblyPage(m_costContextMenu, this))
     , m_timeLineWidget(new TimeLineWidget(parser, m_filterMenu, m_filterAndZoomStack, this))
+#if QCustomPlot_FOUND
+    , m_frequencyPage(new FrequencyPage(parser, this))
+#endif
     , m_timelineVisible(true)
 {
     m_exportMenu->setIcon(QIcon::fromTheme(QStringLiteral("document-export")));
@@ -89,7 +106,7 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
     ui->lostMessage->hide();
 
     auto dockify = [](QWidget* widget, const QString& id, const QString& title, const QString& shortcut) {
-        auto* dock = new KDDockWidgets::DockWidget(id);
+        auto* dock = new DockWidget(id);
         dock->setWidget(widget);
         dock->setTitle(title);
         dock->toggleAction()->setShortcut(shortcut);
@@ -112,6 +129,10 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
     m_summaryPageDock->addDockWidgetAsTab(m_disassemblyDock, KDDockWidgets::InitialVisibilityOption::StartHidden);
     m_disassemblyDock->toggleAction()->setEnabled(false);
     m_summaryPageDock->setAsCurrentTab();
+#if QCustomPlot_FOUND
+    m_frequencyDock = dockify(m_frequencyPage, QStringLiteral("frequency"), tr("Fr&equency"), tr("Ctrl+E"));
+    m_summaryPageDock->addDockWidgetAsTab(m_frequencyDock);
+#endif
 
     m_timeLineDock = dockify(m_timeLineWidget, QStringLiteral("timeLine"), tr("&Time Line"), tr("Ctrl+T"));
     m_contents->addDockWidget(m_timeLineDock, KDDockWidgets::Location_OnBottom);
@@ -135,6 +156,7 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
         m_resultsDisassemblyPage->setArch(data.cpuArchitecture);
     });
     connect(parser, &PerfParser::parserWarning, this, &ResultsPage::showError);
+    connect(parser, &PerfParser::exportFailed, this, &ResultsPage::showError);
 
     connect(m_resultsCallerCalleePage, &ResultsCallerCalleePage::navigateToCode, this, &ResultsPage::navigateToCode);
     connect(m_resultsCallerCalleePage, &ResultsCallerCalleePage::navigateToCodeFailed, this, &ResultsPage::showError);
@@ -143,6 +165,8 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
 
     connect(m_resultsCallerCalleePage, &ResultsCallerCalleePage::jumpToDisassembly, this,
             &ResultsPage::onJumpToDisassembly);
+    connect(m_resultsCallerCalleePage, &ResultsCallerCalleePage::jumpToSourceCode, this,
+            &ResultsPage::onJumpToSourceCode);
     connect(m_resultsSummaryPage, &ResultsSummaryPage::jumpToCallerCallee, this, &ResultsPage::onJumpToCallerCallee);
     connect(m_resultsSummaryPage, &ResultsSummaryPage::openEditor, this, &ResultsPage::onOpenEditor);
     connect(m_resultsSummaryPage, &ResultsSummaryPage::selectSymbol, m_timeLineWidget, &TimeLineWidget::selectSymbol);
@@ -158,12 +182,15 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
     connect(m_resultsFlameGraphPage, &ResultsFlameGraphPage::jumpToCallerCallee, this,
             &ResultsPage::onJumpToCallerCallee);
     connect(m_resultsFlameGraphPage, &ResultsFlameGraphPage::openEditor, this, &ResultsPage::onOpenEditor);
-    connect(m_resultsFlameGraphPage, &ResultsFlameGraphPage::selectSymbol, m_timeLineWidget,
-            &TimeLineWidget::selectSymbol);
+    connect(m_resultsFlameGraphPage, &ResultsFlameGraphPage::selectStack, m_timeLineWidget,
+            &TimeLineWidget::selectStack);
     connect(m_resultsFlameGraphPage, &ResultsFlameGraphPage::jumpToDisassembly, this,
             &ResultsPage::onJumpToDisassembly);
     connect(m_resultsDisassemblyPage, &ResultsDisassemblyPage::jumpToCallerCallee, this,
             &ResultsPage::onJumpToCallerCallee);
+    connect(m_resultsDisassemblyPage, &ResultsDisassemblyPage::navigateToCode, this, &ResultsPage::navigateToCode);
+    connect(m_timeLineWidget, &TimeLineWidget::stacksHovered, m_resultsFlameGraphPage,
+            &ResultsFlameGraphPage::setHoveredStacks);
 
     connect(parser, &PerfParser::parsingStarted, this, [this]() {
         // disable when we apply a filter
@@ -177,6 +204,14 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
         // re-enable when we finished filtering
         m_contents->setEnabled(true);
         m_filterBusyIndicator->setVisible(false);
+    });
+
+    connect(parser, &PerfParser::perfMapFileExists, this, [errorWidget = ui->errorWidget](bool exists) {
+        if (exists) {
+            errorWidget->setText(tr("Perf Map file detected. Consider exporting in the perfparser format or copying "
+                                    "it to another location to keep all backtraces"));
+            errorWidget->show();
+        }
     });
 
     {
@@ -194,6 +229,9 @@ ResultsPage::ResultsPage(PerfParser* parser, QWidget* parent)
         label->setAlignment(Qt::AlignCenter);
         layout->addWidget(label);
     }
+
+    connect(Settings::instance(), &Settings::costAggregationChanged, this,
+            [this, parser] { parser->filterResults(m_filterAndZoomStack->filter()); });
 }
 
 ResultsPage::~ResultsPage() = default;
@@ -208,13 +246,6 @@ void ResultsPage::setAppPath(const QString& path)
     m_resultsCallerCalleePage->setAppPath(path);
 }
 
-static void showDock(KDDockWidgets::DockWidget* dock)
-{
-    dock->show();
-    dock->setFocus();
-    dock->setAsCurrentTab();
-}
-
 void ResultsPage::onJumpToCallerCallee(const Data::Symbol& symbol)
 {
     m_resultsCallerCalleePage->jumpToCallerCallee(symbol);
@@ -225,8 +256,14 @@ void ResultsPage::onJumpToDisassembly(const Data::Symbol& symbol)
 {
     m_disassemblyDock->toggleAction()->setEnabled(true);
     m_resultsDisassemblyPage->setSymbol(symbol);
-    m_resultsDisassemblyPage->showDisassembly();
     showDock(m_disassemblyDock);
+}
+void ResultsPage::onJumpToSourceCode(const Data::Symbol& symbol, const Data::FileLine& line)
+{
+    onJumpToDisassembly(symbol);
+    if (line.isValid()) {
+        m_resultsDisassemblyPage->jumpToSourceLine(line);
+    }
 }
 
 void ResultsPage::setObjdump(const QString& objdump)
@@ -242,7 +279,7 @@ void ResultsPage::onOpenEditor(const Data::Symbol& symbol)
 void ResultsPage::selectSummaryTab()
 {
     m_summaryPageDock->show();
-    m_summaryPageDock->setFocus();
+    m_summaryPageDock->setFocus(Qt::NoFocusReason);
     m_summaryPageDock->setAsCurrentTab();
 }
 
@@ -270,11 +307,16 @@ QMenu* ResultsPage::exportMenu() const
 
 QList<QAction*> ResultsPage::windowActions() const
 {
-    return {
-        m_summaryPageDock->toggleAction(), m_bottomUpDock->toggleAction(),     m_topDownDock->toggleAction(),
-        m_flameGraphDock->toggleAction(),  m_callerCalleeDock->toggleAction(), m_disassemblyDock->toggleAction(),
-        m_timeLineDock->toggleAction(),
+    auto ret = QList<QAction*>
+    {
+        m_summaryPageDock->toggleAction(), m_bottomUpDock->toggleAction(), m_topDownDock->toggleAction(),
+            m_flameGraphDock->toggleAction(), m_callerCalleeDock->toggleAction(), m_disassemblyDock->toggleAction(),
+            m_timeLineDock->toggleAction(),
+#if QCustomPlot_FOUND
+            m_frequencyDock->toggleAction()
+#endif
     };
+    return ret;
 }
 
 void ResultsPage::resizeEvent(QResizeEvent* event)
@@ -296,4 +338,34 @@ void ResultsPage::showError(const QString& message)
     ui->errorWidget->setText(message);
     ui->errorWidget->animatedShow();
     QTimer::singleShot(5000, ui->errorWidget, &KMessageWidget::animatedHide);
+}
+
+void ResultsPage::initDockWidgets(const QVector<CoreDockWidget*>& restored)
+{
+    auto summaryPageDock = toDockWidget(m_summaryPageDock);
+
+    Q_ASSERT(restored.contains(summaryPageDock));
+
+    const auto docks = {
+        m_bottomUpDock,
+        m_topDownDock,
+        m_flameGraphDock,
+        m_callerCalleeDock,
+        m_timeLineDock,
+        m_disassemblyDock,
+#if QCustomPlot_FOUND
+        m_frequencyDock
+#endif
+    };
+    for (auto dock : docks) {
+        auto dockWidget = toDockWidget(dock);
+
+        if (!dock || restored.contains(dockWidget))
+            continue;
+
+        auto initialOption = KDDockWidgets::InitialOption {};
+        if (dock == m_disassemblyDock)
+            initialOption = KDDockWidgets::InitialVisibilityOption::StartHidden;
+        m_summaryPageDock->addDockWidgetAsTab(dock, initialOption);
+    }
 }

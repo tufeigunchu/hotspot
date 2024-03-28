@@ -1,28 +1,8 @@
 /*
-  timelinedelegate.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "timelinedelegate.h"
@@ -42,15 +22,22 @@
 #include <KColorScheme>
 
 #include <algorithm>
+#include <utility>
 
-TimeLineData::TimeLineData()
-    : TimeLineData({}, 0, {}, {}, {})
+namespace {
+QPoint globalPos(const QMouseEvent* event)
 {
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    return event->globalPos();
+#else
+    return event->globalPosition().toPoint();
+#endif
+}
 }
 
-TimeLineData::TimeLineData(const Data::Events& events, quint64 maxCost, const Data::TimeRange& time,
-                           const Data::TimeRange& threadTime, QRect rect)
-    : events(events)
+TimeLineData::TimeLineData(Data::Events events, quint64 maxCost, Data::TimeRange time, Data::TimeRange threadTime,
+                           QRect rect)
+    : events(std::move(events))
     , maxCost(maxCost)
     , time(time)
     , threadTime(threadTime)
@@ -76,15 +63,58 @@ int TimeLineData::mapCostToY(quint64 cost) const
     return double(cost) * yMultiplicator;
 }
 
-void TimeLineData::zoom(const Data::TimeRange& t)
+void TimeLineData::zoom(Data::TimeRange t)
 {
     time = t;
     xMultiplicator = double(w) / time.delta();
 }
 
-namespace {
+template<typename Callback>
+void TimeLineData::findSamples(int mappedX, int costType, int lostEventCostId, bool contains,
+                               const Data::Events::const_iterator& start, const Callback& callback) const
+{
+    if (events.isEmpty()) {
+        return;
+    }
 
-TimeLineData dataFromIndex(const QModelIndex& index, QRect rect, const Data::ZoomAction& zoom)
+    auto it = start;
+    if (contains) {
+        // for a contains check, we must only include events for the correct type
+        // otherwise we might skip the sched switch e.g.
+        while (it->type != costType && it != events.constBegin()) {
+            --it;
+        }
+    }
+
+    while (it != events.constEnd()) {
+        const auto isLost = it->type == lostEventCostId;
+        if (it->type != costType && !isLost) {
+            ++it;
+            continue;
+        }
+        const auto timeX = mapTimeToX(it->time);
+        if (timeX > mappedX) {
+            // event lies to the right of the selected time
+            break;
+        } else if ((contains && mappedX > mapTimeToX(it->time + it->cost)) || (!contains && timeX < mappedX)) {
+            // event lies to the left of the selected time
+            ++it;
+            continue;
+        }
+        Q_ASSERT(contains || mappedX == timeX);
+        callback(*it, isLost);
+        ++it;
+    }
+}
+
+namespace {
+QColor toHoverColor(QColor color)
+{
+    color.setAlphaF(0.5);
+    return color;
+}
+
+TimeLineData dataFromIndex(const QModelIndex& index, QRect rect, Data::ZoomAction zoom)
 {
     TimeLineData data(
         index.data(EventModel::EventsRole).value<Data::Events>(), index.data(EventModel::MaxCostRole).value<quint64>(),
@@ -98,19 +128,25 @@ TimeLineData dataFromIndex(const QModelIndex& index, QRect rect, const Data::Zoo
     return data;
 }
 
-Data::Events::const_iterator findEvent(Data::Events::const_iterator begin, Data::Events::const_iterator end,
-                                       quint64 time)
+Data::Events::const_iterator findEvent(const Data::Events::const_iterator& begin,
+                                       const Data::Events::const_iterator& end, quint64 time)
 {
-    return std::lower_bound(begin, end, time, [](const Data::Event& event, quint64 time) { return event.time < time; });
+    auto byTime = [](const Data::Event& event, quint64 time) { return event.time < time; };
+    auto it = std::lower_bound(begin, end, time, byTime);
+    // it points to the first item for which our predicate returns false, we want to find the item before that
+    // so decrement it if possible or return begin otherwise
+    // if only one event is recorded, it will point to end it->time which will cause asan to complain
+    return (it == begin || (it != end && it->time == time)) ? it : (it - 1);
 }
 }
 
-TimeLineDelegate::TimeLineDelegate(FilterAndZoomStack* filterAndZoomStack, QAbstractItemView* view)
-    : QStyledItemDelegate(view)
+TimeLineDelegate::TimeLineDelegate(FilterAndZoomStack* filterAndZoomStack, QAbstractItemView* view, QObject* parent)
+    : QStyledItemDelegate(parent)
     , m_filterAndZoomStack(filterAndZoomStack)
     , m_view(view)
 {
     m_view->viewport()->installEventFilter(this);
+    m_view->viewport()->setAttribute(Qt::WA_Hover);
 
     connect(filterAndZoomStack, &FilterAndZoomStack::filterChanged, this, &TimeLineDelegate::updateView);
     connect(filterAndZoomStack, &FilterAndZoomStack::zoomChanged, this, &TimeLineDelegate::updateZoomState);
@@ -135,7 +171,7 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
     // transform into target coordinate system
     painter->translate(option.rect.topLeft());
     // account for padding
-    painter->translate(data.padding, data.padding);
+    painter->translate(TimeLineData::padding, TimeLineData::padding);
 
     // visualize the time where the thread was active
     // i.e. paint events for threads that have any in the selected time range
@@ -147,7 +183,7 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
         if (threadTimeRect.right() > option.rect.width())
             threadTimeRect.setRight(option.rect.width());
 
-        KColorScheme scheme(palette.currentColorGroup());
+        const auto scheme = KColorScheme(palette.currentColorGroup());
 
         auto runningColor = scheme.background(KColorScheme::PositiveBackground).color();
         runningColor.setAlpha(128);
@@ -162,6 +198,8 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
 
         if (offCpuCostId != -1) {
             const auto offCpuColor = scheme.background(KColorScheme::NegativeBackground).color();
+            const auto offCpuColorSelected = scheme.foreground(KColorScheme::NegativeText).color();
+            const auto offCpuColorHovered = toHoverColor(offCpuColorSelected);
             for (const auto& event : data.events) {
                 if (event.type != offCpuCostId) {
                     continue;
@@ -169,13 +207,17 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
 
                 const auto x = data.mapTimeToX(event.time);
                 const auto x2 = data.mapTimeToX(event.time + event.cost);
-                painter->fillRect(x, 0, x2 - x, data.h, offCpuColor);
+                const auto& color = m_selectedStacks.contains(event.stackId)
+                    ? offCpuColorSelected
+                    : (m_hoveredStacks.contains(event.stackId) ? offCpuColorHovered : offCpuColor);
+                painter->fillRect(x, 0, x2 - x, data.h, color);
             }
         }
 
-        QPen selectedPen(scheme.foreground(KColorScheme::ActiveText), 1);
-        QPen eventPen(scheme.foreground(KColorScheme::NeutralText), 1);
-        QPen lostEventPen(scheme.foreground(KColorScheme::NegativeText), 1);
+        const auto selectedPen = QPen(scheme.foreground(KColorScheme::ActiveText), 1);
+        const auto hoveredPen = QPen(toHoverColor(selectedPen.color()), 1);
+        const auto eventPen = QPen(scheme.foreground(KColorScheme::NeutralText), 1);
+        const auto lostEventPen = QPen(scheme.foreground(KColorScheme::NegativeText), 1);
 
         int last_x = -1;
         // TODO: accumulate cost for events that fall to the same pixel somehow
@@ -192,7 +234,7 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
             }
 
             const auto x = data.mapTimeToX(event.time);
-            if (x < data.padding || x >= data.w) {
+            if (x < TimeLineData::padding || x >= data.w) {
                 continue;
             }
 
@@ -203,6 +245,8 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
                     painter->setPen(lostEventPen);
                 else if (m_selectedStacks.contains(event.stackId))
                     painter->setPen(selectedPen);
+                else if (m_hoveredStacks.contains(event.stackId))
+                    painter->setPen(hoveredPen);
                 else
                     painter->setPen(eventPen);
 
@@ -219,7 +263,7 @@ void TimeLineDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opti
         const auto startX = std::max(data.mapTimeToX(m_timeSlice.normalized().start), 0);
         const auto endX = std::min(data.mapTimeToX(m_timeSlice.normalized().end), data.w);
         // undo vertical padding manually to fill complete height
-        QRect timeSlice(startX, -data.padding, endX - startX, option.rect.height());
+        const auto timeSlice = QRect(startX, -TimeLineData::padding, endX - startX, option.rect.height());
 
         auto brush = palette.highlight();
         auto color = brush.color();
@@ -237,7 +281,7 @@ bool TimeLineDelegate::helpEvent(QHelpEvent* event, QAbstractItemView* view, con
     if (event->type() == QEvent::ToolTip) {
         const auto data = dataFromIndex(index, option.rect, m_filterAndZoomStack->zoom());
         const auto localX = event->pos().x();
-        const auto mappedX = localX - option.rect.x() - data.padding;
+        const auto mappedX = localX - option.rect.x() - TimeLineData::padding;
         const auto time = data.mapXToTime(mappedX);
         const auto start = findEvent(data.events.constBegin(), data.events.constEnd(), time);
         const auto results = index.data(EventModel::EventResultsRole).value<Data::EventResults>();
@@ -254,40 +298,17 @@ bool TimeLineDelegate::helpEvent(QHelpEvent* event, QAbstractItemView* view, con
         auto findSamples = [&](int costType, bool contains) -> FoundSamples {
             FoundSamples ret;
             ret.type = costType;
-            auto it = start;
-            if (contains) {
-                // for a contains check, we must only include events for the correct type
-                // otherwise we might skip the sched switch e.g.
-                while (it->type != costType && it != data.events.constBegin()) {
-                    --it;
-                }
-            }
-            while (it != data.events.constEnd()) {
-                const auto isLost = it->type == results.lostEventCostId;
-                if (it->type != costType && !isLost) {
-                    ++it;
-                    continue;
-                }
-                const auto timeX = data.mapTimeToX(it->time);
-                if (timeX > mappedX) {
-                    // event lies to the right of the selected time
-                    break;
-                } else if (contains && mappedX > data.mapTimeToX(it->time + it->cost)) {
-                    // event lies to the left of the selected time
-                    ++it;
-                    continue;
-                }
-                Q_ASSERT(contains || mappedX == timeX);
-                if (isLost) {
-                    ++ret.numLost;
-                    ret.totalLost += it->cost;
-                } else {
-                    ++ret.numSamples;
-                    ret.maxCost = std::max(ret.maxCost, it->cost);
-                    ret.totalCost += it->cost;
-                }
-                ++it;
-            }
+            data.findSamples(mappedX, costType, results.lostEventCostId, contains, start,
+                             [&ret](const Data::Event& event, bool isLost) {
+                                 if (isLost) {
+                                     ++ret.numLost;
+                                     ret.totalLost += event.cost;
+                                 } else {
+                                     ++ret.numSamples;
+                                     ret.maxCost = std::max(ret.maxCost, event.cost);
+                                     ret.totalCost += event.cost;
+                                 }
+                             });
             return ret;
         };
         auto found = findSamples(m_eventType, false);
@@ -326,22 +347,26 @@ bool TimeLineDelegate::helpEvent(QHelpEvent* event, QAbstractItemView* view, con
 
 bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
 {
-    if (watched != m_view->viewport() || !m_view->isEnabled()) {
-        return false;
-    }
-
     const bool isButtonRelease = event->type() == QEvent::MouseButtonRelease;
     const bool isButtonPress = event->type() == QEvent::MouseButtonPress;
     const bool isMove = event->type() == QEvent::MouseMove;
-    if (!isButtonRelease && !isButtonPress && !isMove) {
-        return false;
+    const bool isHover = event->type() == QEvent::HoverEnter || event->type() == QEvent::HoverMove
+        || event->type() == QEvent::HoverLeave;
+    if (!isButtonRelease && !isButtonPress && !isMove && !isHover) {
+        return QStyledItemDelegate::eventFilter(watched, event);
     }
 
-    const auto* mouseEvent = static_cast<QMouseEvent*>(event);
-    const bool isLeftButtonEvent = mouseEvent->button() == Qt::LeftButton || mouseEvent->buttons() == Qt::LeftButton;
-    const bool isRightButtonEvent = mouseEvent->button() == Qt::RightButton || mouseEvent->buttons() == Qt::RightButton;
+    if (watched != m_view->viewport() || !m_view->isEnabled()) {
+        return QStyledItemDelegate::eventFilter(watched, event);
+    }
 
-    const auto pos = mouseEvent->localPos();
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    const auto pos = isHover ? static_cast<QHoverEvent*>(event)->pos() : static_cast<QMouseEvent*>(event)->localPos();
+#else
+    const auto pos =
+        isHover ? static_cast<QHoverEvent*>(event)->position() : static_cast<QMouseEvent*>(event)->position();
+#endif
+
     // the pos may lay outside any valid index, but for the code below we need
     // to query for some values that require any valid index. use the first rows index
     const auto alwaysValidIndex = m_view->model()->index(0, EventModel::EventsColumn);
@@ -352,9 +377,52 @@ bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
     const bool isZoomed = zoom.isValid();
     const bool isFiltered = filter.isValid();
 
+    if (isHover) {
+        QSet<qint32> stacks;
+        stacks.reserve(m_hoveredStacks.size());
+        if (inEventsColumn && event->type() != QEvent::HoverLeave) {
+            const auto results = alwaysValidIndex.data(EventModel::EventResultsRole).value<Data::EventResults>();
+            const auto data = dataFromIndex(m_view->indexAt(pos.toPoint()), visualRect, zoom);
+            const auto hoverX = pos.x() - visualRect.left() - TimeLineData::padding;
+
+            const auto time = data.mapXToTime(pos.x() - visualRect.left() - TimeLineData::padding);
+            const auto start = findEvent(data.events.constBegin(), data.events.constEnd(), time);
+            auto findSamples = [&](int costType, bool contains) {
+                bool foundAny = false;
+                data.findSamples(hoverX, costType, results.lostEventCostId, contains, start,
+                                 [&](const Data::Event& event, bool isLost) {
+                                     foundAny = true;
+                                     if (isLost || event.stackId == -1)
+                                         return;
+                                     stacks.insert(event.stackId);
+                                 });
+                return foundAny;
+            };
+
+            auto found = findSamples(m_eventType, false);
+            if (!found && results.offCpuTimeCostId != -1) {
+                // check whether we are hovering an off-CPU area
+                found = findSamples(results.offCpuTimeCostId, true);
+            }
+            Q_UNUSED(found);
+        }
+
+        if (stacks != m_hoveredStacks) {
+            m_hoveredStacks = stacks;
+            emit stacksHovered(stacks);
+            updateView();
+        }
+
+        return true;
+    }
+
+    const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+    const bool isLeftButtonEvent = mouseEvent->button() == Qt::LeftButton || mouseEvent->buttons() == Qt::LeftButton;
+    const bool isRightButtonEvent = mouseEvent->button() == Qt::RightButton || mouseEvent->buttons() == Qt::RightButton;
+
     if (isLeftButtonEvent && inEventsColumn) {
         const auto data = dataFromIndex(alwaysValidIndex, visualRect, zoom);
-        const auto time = data.mapXToTime(pos.x() - visualRect.left() - data.padding);
+        const auto time = data.mapXToTime(pos.x() - visualRect.left() - TimeLineData::padding);
 
         if (isButtonPress) {
             m_timeSlice.start = time;
@@ -370,7 +438,7 @@ bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
     const bool haveContextInfo = index.isValid() || isZoomed || isFiltered;
     const bool showContextMenu = isButtonRelease
         && ((isRightButtonEvent && haveContextInfo) || (isLeftButtonEvent && isTimeSpanSelected)) && index.isValid()
-        && !index.model()->rowCount(index); // when the index has children, don't show the context menu
+        && index.parent().isValid(); // don't show context menu on the top most categories (CPUs / Processes)
 
     const auto timeSlice = m_timeSlice.normalized();
 
@@ -464,7 +532,7 @@ bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
             contextMenu->addSeparator();
             contextMenu->addAction(m_filterAndZoomStack->actions().resetFilterAndZoom);
         }
-        contextMenu->popup(mouseEvent->globalPos());
+        contextMenu->popup(globalPos(mouseEvent));
         return true;
     } else if (isTimeSpanSelected && isLeftButtonEvent) {
         const auto& data = alwaysValidIndex.data(EventModel::EventResultsRole).value<Data::EventResults>();
@@ -489,7 +557,7 @@ bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
             }
         }
 
-        QToolTip::showText(mouseEvent->globalPos(),
+        QToolTip::showText(globalPos(mouseEvent),
                            tr("ΔT: %1\n"
                               "Events: %2 (%3) from %4 thread(s), %5 process(es)\n"
                               "sum of %6: %7 (%8)")
@@ -500,7 +568,7 @@ bool TimeLineDelegate::eventFilter(QObject* watched, QEvent* event)
                            m_view);
     }
 
-    return false;
+    return QStyledItemDelegate::eventFilter(watched, event);
 }
 
 void TimeLineDelegate::setEventType(int type)
@@ -509,7 +577,7 @@ void TimeLineDelegate::setEventType(int type)
     updateView();
 }
 
-void TimeLineDelegate::setSelectedStacks(const QVector<qint32>& selectedStacks)
+void TimeLineDelegate::setSelectedStacks(const QSet<qint32>& selectedStacks)
 {
     m_selectedStacks = selectedStacks;
     updateView();

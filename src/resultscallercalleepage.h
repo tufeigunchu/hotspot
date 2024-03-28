@@ -1,33 +1,16 @@
 /*
-  resultscallercalleepage.h
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
 
 #include <QWidget>
+
+#include <memory>
 
 namespace Ui {
 class ResultsCallerCalleePage;
@@ -35,6 +18,7 @@ class ResultsCallerCalleePage;
 
 namespace Data {
 struct Symbol;
+struct FileLine;
 }
 
 class QSortFilterProxyModel;
@@ -43,12 +27,15 @@ class QModelIndex;
 class PerfParser;
 class CallerCalleeModel;
 class FilterAndZoomStack;
+class CostContextMenu;
+class CallgraphWidget;
 
 class ResultsCallerCalleePage : public QWidget
 {
     Q_OBJECT
 public:
-    explicit ResultsCallerCalleePage(FilterAndZoomStack* filterStack, PerfParser* parser, QWidget* parent = nullptr);
+    explicit ResultsCallerCalleePage(FilterAndZoomStack* filterStack, PerfParser* parser, CostContextMenu* contextMenu,
+                                     QWidget* parent = nullptr);
     ~ResultsCallerCalleePage();
 
     void setSysroot(const QString& path);
@@ -59,13 +46,13 @@ public:
     void openEditor(const Data::Symbol& symbol);
 
 private slots:
-    void onSourceMapContextMenu(const QPoint& pos);
-    void onSourceMapActivated(const QModelIndex& index);
+    void onSourceMapContextMenu(QPoint pos);
 
 signals:
     void navigateToCode(const QString& url, int lineNumber, int columnNumber);
     void navigateToCodeFailed(const QString& message);
     void selectSymbol(const Data::Symbol& symbol);
+    void jumpToSourceCode(const Data::Symbol& symbol, const Data::FileLine& line);
     void jumpToDisassembly(const Data::Symbol& symbol);
 
 private:
@@ -80,9 +67,10 @@ private:
         int lineNumber = -1;
     };
     SourceMapLocation toSourceMapLocation(const QModelIndex& index) const;
-    SourceMapLocation toSourceMapLocation(const QString& location, const Data::Symbol& symbol) const;
+    SourceMapLocation toSourceMapLocation(const Data::FileLine& fileLine, const Data::Symbol& symbol) const;
 
-    QScopedPointer<Ui::ResultsCallerCalleePage> ui;
+    std::unique_ptr<Ui::ResultsCallerCalleePage> ui;
+    CallgraphWidget* m_callgraph;
 
     CallerCalleeModel* m_callerCalleeCostModel;
     QSortFilterProxyModel* m_callerCalleeProxy;

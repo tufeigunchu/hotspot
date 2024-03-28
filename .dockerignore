@@ -2,5 +2,12 @@ build*/
 .git
 *.AppImage
 **/perf.data
+!3rdparty/perfparser/**/perf.data
 **/perf.data.old
 **/a.out
+3rdparty/perfparser/build*/
+.github
+scripts/compile-test
+scripts/appimage
+scripts/output
+.cache

@@ -1,10 +1,17 @@
+/*
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+*/
+
+#include <math.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <math.h>
 
-int main()
+int main(void)
 {
     pid_t child = fork();
     if (child == 0) {

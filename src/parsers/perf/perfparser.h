@@ -1,28 +1,8 @@
 /*
-  perfparser.h
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
@@ -34,6 +14,7 @@
 #include <models/data.h>
 
 class QUrl;
+class QTemporaryFile;
 
 // TODO: create a parser interface
 class PerfParser : public QObject
@@ -43,14 +24,16 @@ public:
     explicit PerfParser(QObject* parent = nullptr);
     ~PerfParser();
 
-    void startParseFile(const QString& path, const QString& sysroot, const QString& kallsyms, const QString& debugPaths,
-                        const QString& extraLibPaths, const QString& appPath, const QString& arch);
+    void startParseFile(const QString& path);
 
     void filterResults(const Data::FilterAction& filter);
 
     void stop();
 
     void exportResults(const QUrl& url);
+
+    // used when directly exporting without parsing for visualization purposes
+    void exportResults(const QString& path, const QUrl& url);
 
     Data::BottomUpResults bottomUpResults() const
     {
@@ -70,22 +53,40 @@ signals:
     void summaryDataAvailable(const Data::Summary& data);
     void bottomUpDataAvailable(const Data::BottomUpResults& data);
     void topDownDataAvailable(const Data::TopDownResults& data);
+    void perLibraryDataAvailable(const Data::PerLibraryResults& data);
     void callerCalleeDataAvailable(const Data::CallerCalleeResults& data);
+    void tracepointDataAvailable(const Data::TracepointResults& data);
+    void frequencyDataAvailable(const Data::FrequencyResults& data);
     void eventsAvailable(const Data::EventResults& events);
+    void threadNamesAvailable(const Data::ThreadNames& threadNames);
     void parsingFinished();
     void parsingFailed(const QString& errorMessage);
+    void exportFailed(const QString& errorMessage);
     void progress(float progress);
+    void debugInfoDownloadProgress(const QString& module, const QString& url, qint64 numerator, qint64 denominator);
     void stopRequested();
+    void perfMapFileExists(bool exists);
 
     void parserWarning(const QString& errorMessage);
     void exportFinished(const QUrl& url);
 
 private:
+    bool initParserArgs(const QString& path);
+
+    friend class TestPerfParser;
+    QString decompressIfNeeded(const QString& path);
+
     // only set once after the initial startParseFile finished
+    QString m_parserBinary;
     QStringList m_parserArgs;
     Data::BottomUpResults m_bottomUpResults;
     Data::CallerCalleeResults m_callerCalleeResults;
+    Data::TracepointResults m_tracepointResults;
     Data::EventResults m_events;
+    Data::FrequencyResults m_frequencyResults;
     std::atomic<bool> m_isParsing;
     std::atomic<bool> m_stopRequested;
+    std::atomic<bool> m_costAggregationChanged;
+    std::unique_ptr<QTemporaryFile> m_decompressed;
+    Data::ThreadNames m_threadNames;
 };

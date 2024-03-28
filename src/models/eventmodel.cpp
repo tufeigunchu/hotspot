@@ -1,28 +1,8 @@
 /*
-  eventmodel.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "eventmodel.h"
@@ -32,12 +12,9 @@
 #include <QDebug>
 #include <QSet>
 
-static bool operator<(const EventModel::Process& process, qint32 pid)
-{
-    return process.pid < pid;
-}
-
 namespace {
+constexpr auto orderProcessByPid = [](const EventModel::Process& process, qint32 pid) { return process.pid < pid; };
+
 enum class Tag : quint8
 {
     Invalid = 0,
@@ -177,8 +154,10 @@ QVariant EventModel::data(const QModelIndex& index, int role) const
         const auto& process = m_processes.value(index.row());
         if (role == Qt::DisplayRole)
             return tr("%1 (#%2)").arg(process.name, QString::number(process.pid));
-        else if (role == SortRole)
+        else if (role == SortRole || role == ProcessIdRole || role == ThreadIdRole)
             return process.pid;
+        else if (role == CpuIdRole)
+            return Data::INVALID_CPU_ID;
 
         if (role == Qt::ToolTipRole) {
             QString tooltip =
@@ -246,7 +225,7 @@ QVariant EventModel::data(const QModelIndex& index, int role) const
     } else if (role == CpuIdRole) {
         return cpu ? cpu->cpuId : Data::INVALID_CPU_ID;
     } else if (role == EventsRole) {
-        return QVariant::fromValue(thread ? thread->events : cpu->events);
+        return QVariant::fromValue(thread ? thread->events : (cpu ? cpu->events : Data::Events()));
     } else if (role == SortRole) {
         if (index.column() == ThreadColumn)
             return thread ? thread->tid : cpu->cpuId;
@@ -315,7 +294,7 @@ void EventModel::setData(const Data::EventResults& data)
             m_totalOffCpuTime += thread.offCpuTime;
             m_totalOnCpuTime += thread.time.delta() - thread.offCpuTime;
             m_totalEvents += thread.events.size();
-            auto it = std::lower_bound(m_processes.begin(), m_processes.end(), thread.pid);
+            auto it = std::lower_bound(m_processes.begin(), m_processes.end(), thread.pid, orderProcessByPid);
             if (it == m_processes.end() || it->pid != thread.pid) {
                 m_processes.insert(it, {thread.pid, {thread.tid}, thread.name});
             } else {

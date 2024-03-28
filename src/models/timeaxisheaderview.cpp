@@ -1,28 +1,9 @@
 /*
-  timeaxisheaderview.cpp
+    SPDX-FileCopyrightText: Koen Poppe
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2020 Koen Poppe
-  Copyright (C) 2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "timeaxisheaderview.h"
@@ -31,11 +12,32 @@
 #include <QPainter>
 #include <QtMath>
 
+#include <KColorScheme>
+
 #include "../util.h"
 #include "eventmodel.h"
 #include "filterandzoomstack.h"
 
+#include <QEvent>
+#include <QHelpEvent>
+#include <QToolTip>
+
 #include <PrefixTickLabels.h>
+
+namespace {
+auto xForTimeFactory(Data::TimeRange timeRange, Data::TimeRange zoomTime, int width, int pos)
+{
+    const double oneNanoSecond = 1.0e-9;
+    const double start = (zoomTime.start - timeRange.start) * oneNanoSecond;
+    const double end = (zoomTime.end - timeRange.start) * oneNanoSecond;
+
+    const double resolution = (end - start) / width;
+
+    return [pos, start, resolution](double time) {
+        return pos + static_cast<int>(std::round((time - start) / resolution));
+    };
+}
+}
 
 TimeAxisHeaderView::TimeAxisHeaderView(const FilterAndZoomStack* filterAndZoomStack, QWidget* parent)
     : QHeaderView(Qt::Horizontal, parent)
@@ -48,7 +50,7 @@ TimeAxisHeaderView::TimeAxisHeaderView(const FilterAndZoomStack* filterAndZoomSt
     connect(filterAndZoomStack, &FilterAndZoomStack::zoomChanged, this, &TimeAxisHeaderView::emitHeaderDataChanged);
 }
 
-void TimeAxisHeaderView::setTimeRange(const Data::TimeRange& timeRange)
+void TimeAxisHeaderView::setTimeRange(Data::TimeRange timeRange)
 {
     m_timeRange = timeRange;
     emitHeaderDataChanged();
@@ -56,7 +58,43 @@ void TimeAxisHeaderView::setTimeRange(const Data::TimeRange& timeRange)
 
 void TimeAxisHeaderView::emitHeaderDataChanged()
 {
-    emit headerDataChanged(this->orientation(), EventModel::EventsColumn, EventModel::EventsColumn);
+    headerDataChanged(this->orientation(), EventModel::EventsColumn, EventModel::EventsColumn);
+}
+
+bool TimeAxisHeaderView::event(QEvent* event)
+{
+    if (event->type() == QEvent::ToolTip) {
+        auto helpEvent = static_cast<QHelpEvent*>(event);
+
+        auto zoomTime = m_filterAndZoomStack->zoom().time;
+        if (!zoomTime.isValid())
+            zoomTime = m_timeRange; // full
+
+        const auto xForTime = xForTimeFactory(m_timeRange, zoomTime, sectionSize(EventModel::EventsColumn),
+                                              sectionPosition(EventModel::EventsColumn));
+
+        const auto oneNanoSecond = 1e-9;
+        for (const auto& tracepoint : std::as_const(m_tracepoints.tracepoints)) {
+            if (zoomTime.contains(tracepoint.time)) {
+                if (helpEvent->pos().x() == xForTime((tracepoint.time - m_timeRange.start) * oneNanoSecond)) {
+                    QToolTip::showText(helpEvent->globalPos(), tracepoint.name);
+                    return true;
+                }
+            }
+        }
+
+        QToolTip::hideText();
+        event->ignore();
+
+        return true;
+    }
+    return QHeaderView::event(event);
+}
+
+void TimeAxisHeaderView::setTracepoints(const Data::TracepointResults& tracepoints)
+{
+    m_tracepoints = tracepoints;
+    update();
 }
 
 void TimeAxisHeaderView::paintSection(QPainter* painter, const QRect& rect, int logicalIndex) const
@@ -82,10 +120,8 @@ void TimeAxisHeaderView::paintSection(QPainter* painter, const QRect& rect, int 
     const double start = (zoomTime.start - m_timeRange.start) * oneNanoSecond;
     const double end = (zoomTime.end - m_timeRange.start) * oneNanoSecond;
 
-    const double resolution = (end - start) / rect.width();
-    const auto xForTime = [rect, start, resolution](const double time) {
-        return rect.x() + static_cast<int>(std::round((time - start) / resolution));
-    };
+    const auto xForTime = xForTimeFactory(m_timeRange, zoomTime, sectionSize(EventModel::EventsColumn),
+                                          sectionPosition(EventModel::EventsColumn));
 
     const int fontSize = painter->fontMetrics().height();
     const int startY = rect.height() - s_tickHeight - 2 * fontSize;
@@ -97,6 +133,19 @@ void TimeAxisHeaderView::paintSection(QPainter* painter, const QRect& rect, int 
 
     const QColor tickColor = palette().windowText().color();
     const QColor prefixedColor = palette().highlight().color();
+
+    if (!m_tracepoints.tracepoints.isEmpty()) {
+        const auto scheme = KColorScheme(palette().currentColorGroup());
+        const auto tracepointPen = QPen(scheme.foreground(KColorScheme::LinkText), 1);
+        painter->setPen(tracepointPen);
+
+        for (const auto& tracepoint : m_tracepoints.tracepoints) {
+            if (!zoomTime.contains(tracepoint.time))
+                continue;
+            const auto x = xForTime((tracepoint.time - m_timeRange.start) * oneNanoSecond);
+            painter->drawLine(x, rect.height() / 2, x, rect.height());
+        }
+    }
 
     // Draw the long prefix tick and its label
 

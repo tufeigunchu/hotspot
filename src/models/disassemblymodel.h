@@ -1,54 +1,60 @@
 /*
-  disassemblymodel.h
+    SPDX-FileCopyrightText: Darya Knysh <d.knysh@nips.ru>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2021 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Darya Knysh <d.knysh@nips.ru>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
+#pragma once
+
+#include <memory>
 #include <QAbstractTableModel>
+#include <QTextLine>
+
 #include "data.h"
 #include "disassemblyoutput.h"
+#include "highlightedtext.h"
+
+namespace KSyntaxHighlighting {
+class Definition;
+class Repository;
+}
+
+enum class Direction;
 
 class DisassemblyModel : public QAbstractTableModel
 {
     Q_OBJECT
 public:
-    explicit DisassemblyModel(QObject *parent = nullptr);
-    ~DisassemblyModel();
+    explicit DisassemblyModel(KSyntaxHighlighting::Repository* repository, QObject* parent = nullptr);
+    ~DisassemblyModel() override;
 
-    void setDisassembly(const DisassemblyOutput& disassemblyOutput);
-    void setResults(const Data::CallerCalleeResults& results);
+    void setDisassembly(const DisassemblyOutput& disassemblyOutput, const Data::CallerCalleeResults& results);
 
     void clear();
+    QModelIndex findIndexWithOffset(int offset);
 
-    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
-    int columnCount(const QModelIndex &parent = QModelIndex()) const override;
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override;
+    int columnCount(const QModelIndex& parent = QModelIndex()) const override;
 
-    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override;
     QVariant headerData(int section, Qt::Orientation orientation, int role = Qt::DisplayRole) const override;
+    QSize span(const QModelIndex& index) const override;
+
+    Data::FileLine fileLineForIndex(const QModelIndex& index) const;
+    QModelIndex indexForFileLine(const Data::FileLine& line) const;
+
+    HighlightedText* highlightedText()
+    {
+        return &m_highlightedText;
+    }
 
     enum Columns
     {
+        AddrColumn,
+        BranchColumn,
+        HexdumpColumn,
         DisassemblyColumn,
         COLUMN_COUNT
     };
@@ -57,9 +63,27 @@ public:
     {
         CostRole = Qt::UserRole,
         TotalCostRole = Qt::UserRole + 1,
+        HighlightRole,
+        AddrRole,
+        LinkedFunctionNameRole,
+        LinkedFunctionOffsetRole,
+        RainbowLineNumberRole,
+        SyntaxHighlightRole,
     };
+
+signals:
+    void resultFound(QModelIndex index);
+    void searchEndReached();
+
+public slots:
+    void updateHighlighting(int line);
+    void find(const QString& search, Direction direction, int offset);
+    void scrollToLine(const QString& lineNumber);
+
 private:
+    HighlightedText m_highlightedText;
     DisassemblyOutput m_data;
     Data::CallerCalleeResults m_results;
-    int m_numTypes;
+    int m_numTypes = 0;
+    int m_highlightLine = 0;
 };

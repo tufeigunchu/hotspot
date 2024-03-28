@@ -1,42 +1,27 @@
 /*
-  main.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcessEnvironment>
+#include <QUrl>
 
 #include "dockwidgetsetup.h"
 #include "hotspot-config.h"
 #include "mainwindow.h"
-#include "models/data.h"
+#include "parsers/perf/perfparser.h"
+#include "settings.h"
 #include "util.h"
 
+#include <KLocalizedString>
 #include <ThreadWeaver/ThreadWeaver>
 #include <QThread>
 
@@ -72,21 +57,39 @@ void Q_DECL_UNUSED initRCCIconTheme()
 }
 #endif
 
+std::unique_ptr<QCoreApplication> createApplication(int& argc, char* argv[])
+{
+    const std::initializer_list<std::string_view> nonGUIOptions = {"--version", "-v", "--exportTo",
+                                                                   "--help",    "-h", "--help-all"};
+
+    // create command line app if one of the command-line only options are used
+    for (int i = 1; i < argc; ++i) {
+        if (std::find(nonGUIOptions.begin(), nonGUIOptions.end(), argv[i]) != nonGUIOptions.end()) {
+            return std::make_unique<QCoreApplication>(argc, argv);
+        }
+    }
+
+    // otherwise create full gui app
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    QGuiApplication::setAttribute(Qt::AA_UseHighDpiPixmaps, true);
+#endif
+    return std::make_unique<QApplication>(argc, argv);
+}
+
 int main(int argc, char** argv)
 {
+    KLocalizedString::setApplicationDomain("hotspot");
     QCoreApplication::setOrganizationName(QStringLiteral("KDAB"));
     QCoreApplication::setOrganizationDomain(QStringLiteral("kdab.com"));
     QCoreApplication::setApplicationName(QStringLiteral("hotspot"));
     QCoreApplication::setApplicationVersion(QStringLiteral(HOTSPOT_VERSION_STRING));
-    QGuiApplication::setAttribute(Qt::AA_UseHighDpiPixmaps, true);
 
-    QApplication app(argc, argv);
+    auto app = createApplication(argc, argv);
 
     // init
     Util::appImageEnvironment();
 
 #if APPIMAGE_BUILD
-
     // cleanup the environment when we are running from within the AppImage
     // to allow launching system applications using Qt without them loading
     // the bundled Qt we ship in the AppImage
@@ -97,108 +100,168 @@ int main(int argc, char** argv)
     initRCCIconTheme();
 #endif
 
-    app.setWindowIcon(QIcon(QStringLiteral(":/images/icons/512-hotspot_app_icon.png")));
-    qRegisterMetaType<Data::Summary>();
-    qRegisterMetaType<Data::BottomUp>();
-    qRegisterMetaType<Data::TopDown>();
-    qRegisterMetaType<Data::CallerCalleeEntryMap>("Data::CallerCalleeEntryMap");
-    qRegisterMetaType<Data::BottomUpResults>();
-    qRegisterMetaType<Data::TopDownResults>();
-    qRegisterMetaType<Data::CallerCalleeResults>();
-    qRegisterMetaType<Data::EventResults>();
-
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("Linux perf GUI for performance analysis."));
     parser.addHelpOption();
     parser.addVersionOption();
 
-    QCommandLineOption sysroot(QLatin1String("sysroot"),
-                               QCoreApplication::translate("main", "Path to sysroot which is used to find libraries."),
-                               QLatin1String("path"));
+    const auto sysroot =
+        QCommandLineOption(QStringLiteral("sysroot"),
+                           QCoreApplication::translate("main", "Path to sysroot which is used to find libraries."),
+                           QStringLiteral("path"));
     parser.addOption(sysroot);
 
-    QCommandLineOption kallsyms(
-        QLatin1String("kallsyms"),
+    const auto kallsyms = QCommandLineOption(
+        QStringLiteral("kallsyms"),
         QCoreApplication::translate("main", "Path to kallsyms file which is used to resolve kernel symbols."),
-        QLatin1String("path"));
+        QStringLiteral("path"));
     parser.addOption(kallsyms);
 
-    QCommandLineOption debugPaths(
-        QLatin1String("debugPaths"),
-        QCoreApplication::translate("main", "Colon separated list of paths that contain debug information."),
-        QLatin1String("paths"));
+    const auto debugPaths = QCommandLineOption(
+        QStringLiteral("debugPaths"),
+        QCoreApplication::translate("main",
+                                    "Colon separated list of paths that contain debug information. These paths are "
+                                    "relative to the executable and not to the current working directory."),
+        QStringLiteral("paths"));
     parser.addOption(debugPaths);
 
-    QCommandLineOption extraLibPaths(
-        QLatin1String("extraLibPaths"),
+    const auto extraLibPaths = QCommandLineOption(
+        QStringLiteral("extraLibPaths"),
         QCoreApplication::translate("main", "Colon separated list of extra paths to find libraries."),
-        QLatin1String("paths"));
+        QStringLiteral("paths"));
     parser.addOption(extraLibPaths);
 
-    QCommandLineOption appPath(
-        QLatin1String("appPath"),
+    const auto appPath = QCommandLineOption(
+        QStringLiteral("appPath"),
         QCoreApplication::translate("main", "Path to folder containing the application executable and libraries."),
-        QLatin1String("path"));
+        QStringLiteral("path"));
     parser.addOption(appPath);
 
-    QCommandLineOption arch(QLatin1String("arch"),
+    const auto sourcePath = QCommandLineOption(
+        QStringLiteral("sourcePaths"),
+        QCoreApplication::translate("main", "Colon separated list of search paths for the source code."),
+        QStringLiteral("paths"));
+    parser.addOption(sourcePath);
+
+    QCommandLineOption arch(QStringLiteral("arch"),
                             QCoreApplication::translate("main", "Architecture to use for unwinding."),
-                            QLatin1String("path"));
+                            QStringLiteral("path"));
     parser.addOption(arch);
+
+    const auto exportTo = QCommandLineOption(
+        QStringLiteral("exportTo"),
+        QCoreApplication::translate("main",
+                                    "Path to .perfparser output file to which the input data should be exported. A "
+                                    "single input file has to be given too."),
+        QStringLiteral("path"));
+    parser.addOption(exportTo);
 
     parser.addPositionalArgument(
         QStringLiteral("files"),
         QCoreApplication::translate("main", "Optional input files to open on startup, i.e. perf.data files."),
         QStringLiteral("[files...]"));
 
-    parser.process(app);
-
-    setupDockWidgets();
+    parser.process(*app);
 
     ThreadWeaver::Queue::instance()->setMaximumNumberOfThreads(QThread::idealThreadCount());
 
-    auto applyCliArgs = [&](MainWindow* window) {
-        if (parser.isSet(sysroot)) {
-            window->setSysroot(parser.value(sysroot));
-        }
-        if (parser.isSet(kallsyms)) {
-            window->setKallsyms(parser.value(kallsyms));
-        }
-        if (parser.isSet(debugPaths)) {
-            window->setDebugPaths(parser.value(debugPaths));
-        }
-        if (parser.isSet(extraLibPaths)) {
-            window->setExtraLibPaths(parser.value(extraLibPaths));
-        }
-        if (parser.isSet(appPath)) {
-            window->setAppPath(parser.value(appPath));
-        }
-        if (parser.isSet(arch)) {
-            window->setArch(parser.value(arch));
-        }
+    auto applyCliArgs = [&](Settings* settings) {
+        using Setter = void (Settings::*)(const QString&);
+        auto applyArg = [&](const QCommandLineOption& arg, Setter setter) {
+            if (parser.isSet(arg)) {
+                // set a custom env when any arg is set on the mainwindow
+                // we don't want to overwrite the previous one's with our custom settings
+                settings->setLastUsedEnvironment({});
+
+                (settings->*setter)(parser.value(arg));
+            }
+        };
+        applyArg(sysroot, &Settings::setSysroot);
+        applyArg(kallsyms, &Settings::setKallsyms);
+        applyArg(debugPaths, &Settings::setDebugPaths);
+        applyArg(extraLibPaths, &Settings::setExtraLibPaths);
+        applyArg(appPath, &Settings::setAppPath);
+        applyArg(arch, &Settings::setArch);
+        applyArg(sourcePath, &Settings::setSourceCodePaths);
     };
 
-    for (const auto& file : parser.positionalArguments()) {
-        auto window = new MainWindow;
-        applyCliArgs(window);
-        window->openFile(file);
-        window->show();
+    auto* settings = Settings::instance();
+    settings->loadFromFile();
+    applyCliArgs(settings);
+
+    auto files = parser.positionalArguments();
+    if (files.size() != 1 && parser.isSet(exportTo)) {
+        QTextStream err(stderr);
+        err << QCoreApplication::translate("main", "Error: expected a single input file to convert, instead of %1.",
+                                           nullptr, files.size())
+                   .arg(files.size())
+            << "\n\n"
+            << parser.helpText();
+        return 1;
     }
 
-    // show at least one mainwindow
-    if (parser.positionalArguments().isEmpty()) {
-        auto window = new MainWindow;
-        applyCliArgs(window);
+    auto* guiApp = qobject_cast<QApplication*>(app.get());
+    MainWindow* window = nullptr;
+    if (guiApp) {
+        QGuiApplication::setWindowIcon(QIcon(QStringLiteral(":/images/icons/512-hotspot_app_icon.png")));
+        setupDockWidgets();
+        window = new MainWindow();
+    }
 
+    const auto originalArguments = QCoreApplication::arguments();
+    // remove leading executable name and trailing positional arguments
+    const auto minimalArguments = originalArguments.mid(1, originalArguments.size() - 1 - files.size());
+
+    while (files.size() > 1) {
+        // spawn new instances if we have more than one file argument
+        const auto file = files.takeLast();
+        MainWindow::openInNewWindow(file, minimalArguments);
+    }
+
+    // we now only have at most one file
+    Q_ASSERT(files.size() <= 1);
+
+    if (!files.isEmpty()) {
+        auto file = files.constFirst();
+        if (QFileInfo(file).isDir()) {
+            file.append(QLatin1String("/perf.data"));
+        }
+
+        if (parser.isSet(exportTo)) {
+            PerfParser perfParser;
+            auto showErrorAndQuit = [file](const QString& errorMessage) {
+                QTextStream err(stderr);
+                err << errorMessage << Qt::endl;
+                QCoreApplication::exit(1);
+            };
+            QObject::connect(&perfParser, &PerfParser::exportFailed, app.get(), showErrorAndQuit);
+            QObject::connect(&perfParser, &PerfParser::exportFinished, app.get(), [file](const QUrl& url) {
+                QTextStream out(stdout);
+                out << QCoreApplication::translate("main", "Input file %1 exported to %2")
+                           .arg(file, url.toDisplayString(QUrl::PrettyDecoded | QUrl::PreferLocalFile))
+                    << Qt::endl;
+                QCoreApplication::exit(0);
+            });
+            auto destination = QUrl::fromUserInput(parser.value(exportTo), QDir::currentPath(), QUrl::AssumeLocalFile);
+            QObject::connect(&perfParser, &PerfParser::parsingFinished, app.get(),
+                             [&perfParser, destination] { perfParser.exportResults(destination); });
+            perfParser.startParseFile(file);
+            return app->exec();
+        }
+
+        if (window) {
+            window->openFile(file);
+        }
+    } else {
         // open perf.data in current CWD, if it exists
         // this brings hotspot closer to the behavior of "perf report"
         const auto perfDataFile = QStringLiteral("perf.data");
-        if (QFile::exists(perfDataFile)) {
+        if (QFile::exists(perfDataFile) && window) {
             window->openFile(perfDataFile);
         }
-
-        window->show();
     }
+    if (window)
+        window->show();
 
-    return app.exec();
+    return QCoreApplication::exec();
 }

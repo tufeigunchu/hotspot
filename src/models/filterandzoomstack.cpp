@@ -1,28 +1,8 @@
 /*
-  filterandzoomstack.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2019-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "filterandzoomstack.h"
@@ -72,6 +52,22 @@ FilterAndZoomStack::FilterAndZoomStack(QObject* parent)
         filterOutBySymbol(data.value<Data::Symbol>());
     });
 
+    m_actions.filterInByBinary =
+        new QAction(QIcon::fromTheme(QStringLiteral("view-filter")), tr("Filter In By Binary"), this);
+    connect(m_actions.filterInByBinary, &QAction::triggered, this, [this]() {
+        const auto data = m_actions.filterInByBinary->data();
+        Q_ASSERT(data.canConvert<QString>());
+        filterInByBinary(data.value<QString>());
+    });
+
+    m_actions.filterOutByBinary =
+        new QAction(QIcon::fromTheme(QStringLiteral("view-filter")), tr("Filter Out By Binary"), this);
+    connect(m_actions.filterOutByBinary, &QAction::triggered, this, [this]() {
+        const auto data = m_actions.filterInByBinary->data();
+        Q_ASSERT(data.canConvert<QString>());
+        filterOutByBinary(data.value<QString>());
+    });
+
     connect(this, &FilterAndZoomStack::filterChanged, this, &FilterAndZoomStack::updateActions);
     connect(this, &FilterAndZoomStack::zoomChanged, this, &FilterAndZoomStack::updateActions);
     updateActions();
@@ -100,7 +96,7 @@ void FilterAndZoomStack::clear()
     m_zoomStack.clear();
 }
 
-void FilterAndZoomStack::filterInByTime(const Data::TimeRange& time)
+void FilterAndZoomStack::filterInByTime(Data::TimeRange time)
 {
     zoomIn(time);
 
@@ -119,7 +115,7 @@ void FilterAndZoomStack::filterInByProcess(qint32 processId)
 void FilterAndZoomStack::filterOutByProcess(qint32 processId)
 {
     Data::FilterAction filter;
-    filter.excludeThreadIds.push_back(processId);
+    filter.excludeProcessIds.push_back(processId);
     applyFilter(filter);
 }
 
@@ -165,6 +161,20 @@ void FilterAndZoomStack::filterOutBySymbol(const Data::Symbol& symbol)
     applyFilter(filter);
 }
 
+void FilterAndZoomStack::filterInByBinary(const QString& binary)
+{
+    Data::FilterAction filter;
+    filter.includeBinaries.insert(binary);
+    applyFilter(filter);
+}
+
+void FilterAndZoomStack::filterOutByBinary(const QString& binary)
+{
+    Data::FilterAction filter;
+    filter.excludeBinaries.insert(binary);
+    applyFilter(filter);
+}
+
 void FilterAndZoomStack::applyFilter(Data::FilterAction filter)
 {
     if (!m_filterStack.isEmpty()) {
@@ -186,6 +196,9 @@ void FilterAndZoomStack::applyFilter(Data::FilterAction filter)
         filter.excludeSymbols += lastFilter.excludeSymbols;
         filter.includeSymbols += lastFilter.includeSymbols;
         filter.includeSymbols.subtract(filter.excludeSymbols);
+        filter.excludeBinaries += lastFilter.excludeBinaries;
+        filter.includeBinaries += lastFilter.includeBinaries;
+        filter.includeBinaries.subtract(filter.excludeBinaries);
     }
 
     m_filterStack.push_back(filter);
@@ -205,7 +218,7 @@ void FilterAndZoomStack::filterOut()
     emit filterChanged(filter());
 }
 
-void FilterAndZoomStack::zoomIn(const Data::TimeRange& time)
+void FilterAndZoomStack::zoomIn(Data::TimeRange time)
 {
     m_zoomStack.append({time.normalized()});
     emit zoomChanged(m_zoomStack.constLast());
@@ -229,7 +242,7 @@ void FilterAndZoomStack::resetFilterAndZoom()
     resetZoom();
 }
 
-void FilterAndZoomStack::updateActions()
+void FilterAndZoomStack::updateActions() const
 {
     const bool isFiltered = filter().isValid();
     m_actions.filterOut->setEnabled(isFiltered);

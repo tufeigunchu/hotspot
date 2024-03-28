@@ -6,27 +6,28 @@ include(KDEFrameworkCompilerSettings)
 # but allow signal/slot keywords
 remove_definitions(-DQT_NO_SIGNALS_SLOTS_KEYWORDS)
 
-option(APPIMAGE_BUILD "configure build for bundling in an appimage" OFF)
-
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 add_subdirectory(models)
 
-ecm_install_icons(ICONS
+ecm_install_icons(
+    ICONS
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/16-apps-hotspot.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/22-apps-hotspot.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/32-apps-hotspot.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/48-apps-hotspot.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/64-apps-hotspot.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/128-apps-hotspot.png
-    DESTINATION ${ICON_INSTALL_DIR} THEME hicolor)
+    DESTINATION
+    ${KDE_INSTALL_ICONDIR}
+    THEME
+    hicolor
+)
 
-set(hotspot_SRCS
+set(HOTSPOT_SRCS
     main.cpp
-
     parsers/perf/perfparser.cpp
     perfrecord.cpp
-
     mainwindow.cpp
     flamegraph.cpp
     aboutdialog.cpp
@@ -45,7 +46,15 @@ set(hotspot_SRCS
     dockwidgetsetup.cpp
     settingsdialog.cpp
     multiconfigwidget.cpp
-
+    perfoutputwidget.cpp
+    perfoutputwidgettext.cpp
+    perfoutputwidgetkonsole.cpp
+    costcontextmenu.cpp
+    initiallystoppedprocess.cpp
+    perfcontrolfifowrapper.cpp
+    errnoutil.cpp
+    recordhost.cpp
+    copyabletreeview.cpp
     # ui files:
     mainwindow.ui
     aboutdialog.ui
@@ -59,49 +68,78 @@ set(hotspot_SRCS
     resultscallercalleepage.ui
     resultsdisassemblypage.ui
     timelinewidget.ui
-    settingsdialog.ui
-    flamegraphsettings.ui
-
+    unwindsettingspage.ui
+    flamegraphsettingspage.ui
+    debuginfodpage.ui
+    callgraphwidget.ui
+    callgraphsettingspage.ui
+    frequencypage.ui
+    disassemblysettingspage.ui
+    perfsettingspage.ui
     # resources:
     resources.qrc
 )
 
-ecm_add_app_icon(hotspot_SRCS ICONS
-    ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/128-hotspot_app_icon.png
+if(KGraphViewerPart_FOUND)
+    set(HOTSPOT_SRCS ${HOTSPOT_SRCS} callgraphwidget.cpp callgraphgenerator.cpp)
+endif()
+
+ecm_add_app_icon(
+    HOTSPOT_SRCS ICONS ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/128-hotspot_app_icon.png
     ${CMAKE_CURRENT_SOURCE_DIR}/images/icons/512-hotspot_app_icon.png
 )
 
-add_executable(hotspot
-    ${hotspot_SRCS}
+if(QCustomPlot_FOUND)
+    set(HOTSPOT_SRCS ${HOTSPOT_SRCS} frequencypage.cpp)
+endif()
+
+add_executable(
+    hotspot
+    ${HOTSPOT_SRCS}
 )
 
-target_link_libraries(hotspot
-    Qt5::Widgets
-    Qt5::Svg
-    KF5::ThreadWeaver
-    KF5::I18n
-    KF5::ConfigWidgets
-    KF5::CoreAddons
-    KF5::ItemViews
-    KF5::ItemModels
-    KF5::KIOCore
-    KF5::KIOFileWidgets
-    KF5::KIOWidgets
-    KF5::KIONTLM
-    KF5::Solid
-    KF5::WindowSystem
-    KF5::Notifications
-    KF5::IconThemes
-    KF5::Parts
+target_link_libraries(
+    hotspot
+    Qt::Widgets
+    Qt::Svg
+    KF${QT_MAJOR_VERSION}::ThreadWeaver
+    KF${QT_MAJOR_VERSION}::ConfigWidgets
+    KF${QT_MAJOR_VERSION}::CoreAddons
+    KF${QT_MAJOR_VERSION}::ItemViews
+    KF${QT_MAJOR_VERSION}::ItemModels
+    KF${QT_MAJOR_VERSION}::KIOCore
+    KF${QT_MAJOR_VERSION}::KIOFileWidgets
+    KF${QT_MAJOR_VERSION}::KIOWidgets
+    KF${QT_MAJOR_VERSION}::Solid
+    KF${QT_MAJOR_VERSION}::WindowSystem
+    KF${QT_MAJOR_VERSION}::Notifications
+    KF${QT_MAJOR_VERSION}::IconThemes
+    KF${QT_MAJOR_VERSION}::Parts
+    KF${QT_MAJOR_VERSION}::I18n
     models
     PrefixTickLabels
     KDAB::kddockwidgets
 )
 
-set_target_properties(hotspot
-    PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/${KDE_INSTALL_BINDIR}"
+if(KFArchive_FOUND)
+    target_link_libraries(hotspot KF${QT_MAJOR_VERSION}::Archive)
+endif()
+
+if(QCustomPlot_FOUND)
+    target_link_libraries(hotspot QCustomPlot::QCustomPlot)
+endif()
+
+set_target_properties(hotspot PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/${KDE_INSTALL_BINDIR}")
+
+install(
+    TARGETS hotspot
+    RUNTIME DESTINATION ${KDE_INSTALL_BINDIR}
 )
 
-install(TARGETS hotspot RUNTIME DESTINATION ${KDE_INSTALL_BINDIR})
-install(FILES hotspot.notifyrc DESTINATION ${KDE_INSTALL_KNOTIFY5RCDIR})
+if(NOT KDE_INSTALL_KNOTIFYRCDIR)
+    set(KDE_INSTALL_KNOTIFYRCDIR ${KDE_INSTALL_KNOTIFY5RCDIR})
+endif()
+install(
+    FILES hotspot.notifyrc
+    DESTINATION ${KDE_INSTALL_KNOTIFYRCDIR}
+)

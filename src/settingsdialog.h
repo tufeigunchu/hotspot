@@ -1,40 +1,27 @@
 /*
-  settingsdialog.h
+    SPDX-FileCopyrightText: Petr Lyapidevskiy <p.lyapidevskiy@nips.ru>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Petr Lyapidevskiy <p.lyapidevskiy@nips.ru>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
 
 #include <KPageDialog>
-#include "multiconfigwidget.h"
+
 #include <memory>
 
 namespace Ui {
-class SettingsDialog;
-class FlamegraphSettings;
+class UnwindSettingsPage;
+class FlamegraphSettingsPage;
+class DebuginfodPage;
+class CallgraphSettingsPage;
+class DisassemblySettingsPage;
+class PerfSettingsPage;
 }
+
+class MultiConfigWidget;
 
 class SettingsDialog : public KPageDialog
 {
@@ -43,9 +30,9 @@ class SettingsDialog : public KPageDialog
 public:
     explicit SettingsDialog(QWidget* parent = nullptr);
     ~SettingsDialog();
-    void initSettings(const QString& configName);
+    void initSettings();
     void initSettings(const QString& sysroot, const QString& appPath, const QString& extraLibPaths,
-                      const QString& debugPaths, const QString& kallsyms, const QString& arch, const QString& objdump);    
+                      const QString& debugPaths, const QString& kallsyms, const QString& arch, const QString& objdump);
     QString sysroot() const;
     QString appPath() const;
     QString extraLibPaths() const;
@@ -53,14 +40,23 @@ public:
     QString kallsyms() const;
     QString arch() const;
     QString objdump() const;
+    QString perfMapPath() const;
 
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
+    void addPerfSettingsPage();
     void addPathSettingsPage();
     void addFlamegraphPage();
+    void addDebuginfodPage();
+    void addCallgraphPage();
+    void addSourcePathPage();
 
-    std::unique_ptr<Ui::SettingsDialog> unwindPage;
-    std::unique_ptr<Ui::FlamegraphSettings> flamegraphPage;
+    std::unique_ptr<Ui::PerfSettingsPage> perfPage;
+    std::unique_ptr<Ui::UnwindSettingsPage> unwindPage;
+    std::unique_ptr<Ui::FlamegraphSettingsPage> flamegraphPage;
+    std::unique_ptr<Ui::DebuginfodPage> debuginfodPage;
+    std::unique_ptr<Ui::DisassemblySettingsPage> disassemblyPage;
+    std::unique_ptr<Ui::CallgraphSettingsPage> callgraphPage;
     MultiConfigWidget* m_configs;
 };

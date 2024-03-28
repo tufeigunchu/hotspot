@@ -1,28 +1,8 @@
 /*
-  treemodel.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "treemodel.h"
@@ -223,4 +203,65 @@ int TopDownModel::selfCostColumn(int cost) const
 {
     Q_ASSERT(cost >= 0 && cost < m_results.selfCosts.numTypes());
     return NUM_BASE_COLUMNS + m_results.inclusiveCosts.numTypes() + cost;
+}
+
+QVariant PerLibraryModel::headerColumnData(int column, int role) const
+{
+    if (role == Qt::DisplayRole) {
+        switch (column) {
+        case Binary:
+            return tr("Binary");
+        }
+        column -= NUM_BASE_COLUMNS;
+        if (column < m_results.costs.numTypes()) {
+            return m_results.costs.typeName(column);
+        }
+
+        column -= m_results.costs.numTypes();
+        return m_results.costs.typeName(column);
+    } else {
+        return {};
+    }
+}
+
+QVariant PerLibraryModel::rowData(const Data::PerLibrary* row, int column, int role) const
+{
+    if (role == Qt::DisplayRole || role == SortRole) {
+        switch (column) {
+        case Binary:
+            return Util::formatString(row->symbol.binary);
+        }
+
+        column -= NUM_BASE_COLUMNS;
+        if (column < m_results.costs.numTypes()) {
+            if (role == SortRole) {
+                return m_results.costs.cost(column, row->id);
+            }
+            return Util::formatCostRelative(m_results.costs.cost(column, row->id), m_results.costs.totalCost(column),
+                                            true);
+        }
+
+        column -= m_results.costs.numTypes();
+        if (role == SortRole) {
+            return m_results.costs.cost(column, row->id);
+        }
+        return Util::formatCostRelative(m_results.costs.cost(column, row->id), m_results.costs.totalCost(column), true);
+    } else if (role == TotalCostRole && column >= NUM_BASE_COLUMNS) {
+        column -= NUM_BASE_COLUMNS;
+        if (column < m_results.costs.numTypes()) {
+            return m_results.costs.totalCost(column);
+        }
+
+        column -= m_results.costs.numTypes();
+        return m_results.costs.totalCost(column);
+    } else if (role == Qt::ToolTipRole) {
+        return Util::formatBinaryTooltip(row->id, row->symbol, m_results.costs);
+    } else {
+        return {};
+    }
+}
+
+int PerLibraryModel::numColumns() const
+{
+    return NUM_BASE_COLUMNS + m_results.costs.numTypes();
 }

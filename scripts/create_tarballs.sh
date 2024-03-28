@@ -1,27 +1,9 @@
 #!/bin/bash
 #
-# This file is part of Hotspot, the Qt GUI for performance analysis.
+# SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+# SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 #
-# Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-# Author: Milian Wolff <milian.wolff@kdab.com>
-#
-# Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-# accordance with Hotspot Commercial License Agreement provided with the Software.
-#
-# Contact info@kdab.com if any conditions of this licensing are not clear to you.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 
 version="$1"
@@ -46,8 +28,10 @@ git clone --branch $version --recurse-submodules \
 
 tar --exclude="*/.git/*" --exclude="*/.git" -cvzf "hotspot-$version.tar.gz" "hotspot-$version"
 tar --exclude="*/.git/*" --exclude="*/.git" -cvzf "hotspot-perfparser-$version.tar.gz" "hotspot-$version/3rdparty/perfparser"
+tar --exclude="*/.git/*" --exclude="*/.git" -cvzf "hotspot-PrefixTickLabels-$version.tar.gz" "hotspot-$version/3rdparty/PrefixTickLabels"
 zip -r --exclude="*/.git/*" --exclude="*/.git" "hotspot-$version.zip" "hotspot-$version"
 zip -r --exclude="*/.git/*" --exclude="*/.git" "hotspot-perfparser-$version.zip" "hotspot-$version/3rdparty/perfparser"
+zip -r --exclude="*/.git/*" --exclude="*/.git" "hotspot-PrefixTickLabels-$version.zip" "hotspot-$version/3rdparty/PrefixTickLabels"
 
-md5sum "hotspot-$version.tar.gz" "hotspot-$version.zip" "hotspot-perfparser-$version.tar.gz" "hotspot-perfparser-$version.zip"
-sha1sum "hotspot-$version.tar.gz" "hotspot-$version.zip" "hotspot-perfparser-$version.tar.gz" "hotspot-perfparser-$version.zip"
+md5sum "hotspot-$version.tar.gz" "hotspot-$version.zip" "hotspot-perfparser-$version.tar.gz" "hotspot-perfparser-$version.zip" "hotspot-PrefixTickLabels-$version.tar.gz" "hotspot-PrefixTickLabels-$version.zip"
+sha1sum "hotspot-$version.tar.gz" "hotspot-$version.zip" "hotspot-perfparser-$version.tar.gz" "hotspot-perfparser-$version.zip" "hotspot-PrefixTickLabels-$version.tar.gz" "hotspot-PrefixTickLabels-$version.zip"

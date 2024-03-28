@@ -1,35 +1,14 @@
 /*
-  timelinedelegate.h
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #pragma once
 
-#include <QScopedPointer>
+#include <QSet>
 #include <QStyledItemDelegate>
-#include <QVector>
 
 #include "data.h"
 
@@ -40,10 +19,9 @@ class FilterAndZoomStack;
 
 struct TimeLineData
 {
-    TimeLineData();
+    TimeLineData() = default;
 
-    TimeLineData(const Data::Events& events, quint64 maxCost, const Data::TimeRange& time,
-                 const Data::TimeRange& threadTime, QRect rect);
+    TimeLineData(Data::Events events, quint64 maxCost, Data::TimeRange time, Data::TimeRange threadTime, QRect rect);
 
     int mapTimeToX(quint64 time) const;
 
@@ -51,17 +29,21 @@ struct TimeLineData
 
     int mapCostToY(quint64 cost) const;
 
-    void zoom(const Data::TimeRange& time);
+    void zoom(Data::TimeRange time);
+
+    template<typename Callback>
+    void findSamples(int mappedX, int costType, int lostEventCostId, bool contains,
+                     const Data::Events::const_iterator& start, const Callback& callback) const;
 
     static const constexpr int padding = 2;
     Data::Events events;
-    quint64 maxCost;
+    quint64 maxCost = 0;
     Data::TimeRange time;
     Data::TimeRange threadTime;
-    int h;
-    int w;
-    double xMultiplicator;
-    double yMultiplicator;
+    int h = 0;
+    int w = 0;
+    double xMultiplicator = 0;
+    double yMultiplicator = 0;
 };
 Q_DECLARE_METATYPE(TimeLineData)
 
@@ -69,7 +51,7 @@ class TimeLineDelegate : public QStyledItemDelegate
 {
     Q_OBJECT
 public:
-    explicit TimeLineDelegate(FilterAndZoomStack* filterAndZoomStack, QAbstractItemView* view);
+    explicit TimeLineDelegate(FilterAndZoomStack* filterAndZoomStack, QAbstractItemView* view, QObject* parent);
     virtual ~TimeLineDelegate();
 
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override;
@@ -78,7 +60,10 @@ public:
                    const QModelIndex& index) override;
 
     void setEventType(int type);
-    void setSelectedStacks(const QVector<qint32>& selectedStacks);
+    void setSelectedStacks(const QSet<qint32>& selectedStacks);
+
+signals:
+    void stacksHovered(const QSet<qint32>& stacks);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -90,6 +75,7 @@ private:
     FilterAndZoomStack* m_filterAndZoomStack = nullptr;
     QAbstractItemView* m_view = nullptr;
     Data::TimeRange m_timeSlice;
-    QVector<qint32> m_selectedStacks;
+    QSet<qint32> m_selectedStacks;
+    QSet<qint32> m_hoveredStacks;
     int m_eventType = 0;
 };

@@ -1,33 +1,15 @@
 /*
-  flamegraph.h
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "flamegraph.h"
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <QAction>
 #include <QApplication>
@@ -38,30 +20,32 @@
 #include <QDebug>
 #include <QDoubleSpinBox>
 #include <QEvent>
+#include <QFontDatabase>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
-#include <QPushButton>
 #include <QRandomGenerator>
 #include <QScrollBar>
 #include <QStyleOption>
 #include <QSvgGenerator>
+#include <QToolBar>
 #include <QToolTip>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 
 #include <KColorScheme>
 #include <KLocalizedString>
-#include <KStandardAction>
 #include <KSqueezedTextLabel>
+#include <KStandardAction>
 #include <ThreadWeaver/ThreadWeaver>
 
 #include "models/filterandzoomstack.h"
 #include "resultsutil.h"
 #include "settings.h"
+#include "util.h"
 
 namespace {
 enum SearchMatchType
@@ -71,12 +55,35 @@ enum SearchMatchType
     DirectMatch,
     ChildMatch
 };
+
+template<class CreateInstance>
+class CustomWidgetAction : public QWidgetAction
+{
+public:
+    explicit CustomWidgetAction(CreateInstance createInstance, QWidget* parent)
+        : QWidgetAction(parent)
+        , _createInstance(createInstance)
+    {
+    }
+
+    QWidget* createWidget(QWidget* parent) override
+    {
+        auto widget = new QWidget(parent);
+        auto layout = new QHBoxLayout(widget);
+        layout->setContentsMargins(0, 0, 0, 0);
+        _createInstance(widget, layout);
+        return widget;
+    }
+
+private:
+    CreateInstance _createInstance;
+};
 }
+
 class FrameGraphicsItem : public QGraphicsRectItem
 {
 public:
-    FrameGraphicsItem(const qint64 cost, Data::Costs::Unit unit, const Data::Symbol& symbol,
-                      FrameGraphicsItem* parent = nullptr);
+    FrameGraphicsItem(qint64 cost, Data::Symbol symbol, FrameGraphicsItem* parent);
 
     qint64 cost() const;
     void setCost(qint64 cost);
@@ -87,6 +94,9 @@ public:
     QString description() const;
     void setSearchMatchType(SearchMatchType matchType);
 
+    bool isExternallyHovered() const;
+    void setIsExternallyHovered(bool isExternallyHovered);
+
 protected:
     void hoverEnterEvent(QGraphicsSceneHoverEvent* event) override;
     void hoverLeaveEvent(QGraphicsSceneHoverEvent* event) override;
@@ -94,20 +104,42 @@ protected:
 private:
     qint64 m_cost;
     Data::Symbol m_symbol;
-    bool m_isHovered;
+    bool m_isHovered = false;
+    bool m_isExternallyHovered = false;
     SearchMatchType m_searchMatch = NoSearch;
+};
+Q_DECLARE_METATYPE(FrameGraphicsItem*)
+
+class FrameGraphicsRootItem : public FrameGraphicsItem
+{
+public:
+    FrameGraphicsRootItem(const qint64 totalCost, Data::Costs::Unit unit, QString costName, const QString& label)
+        : FrameGraphicsItem(totalCost, {label, {}}, nullptr)
+        , m_costName(std::move(costName))
+        , m_unit(unit)
+    {
+    }
+
+    Data::Costs::Unit unit() const
+    {
+        return m_unit;
+    }
+    QString costName() const
+    {
+        return m_costName;
+    }
+
+private:
+    QString m_costName;
     Data::Costs::Unit m_unit;
 };
 
-Q_DECLARE_METATYPE(FrameGraphicsItem*)
+Q_DECLARE_METATYPE(FrameGraphicsRootItem*)
 
-FrameGraphicsItem::FrameGraphicsItem(const qint64 cost, Data::Costs::Unit unit, const Data::Symbol& symbol,
-                                     FrameGraphicsItem* parent)
+FrameGraphicsItem::FrameGraphicsItem(const qint64 cost, Data::Symbol symbol, FrameGraphicsItem* parent)
     : QGraphicsRectItem(parent)
     , m_cost(cost)
-    , m_symbol(symbol)
-    , m_isHovered(false)
-    , m_unit(unit)
+    , m_symbol(std::move(symbol))
 {
     setFlag(QGraphicsItem::ItemIsSelectable);
     setAcceptHoverEvents(true);
@@ -130,7 +162,7 @@ Data::Symbol FrameGraphicsItem::symbol() const
 
 void FrameGraphicsItem::paint(QPainter* painter, const QStyleOptionGraphicsItem* option, QWidget* /*widget*/)
 {
-    if (isSelected() || m_isHovered || m_searchMatch == DirectMatch) {
+    if (isSelected() || m_isHovered || m_isExternallyHovered || m_searchMatch == DirectMatch) {
         auto selectedColor = brush().color();
         selectedColor.setAlpha(255);
         painter->fillRect(rect(), selectedColor);
@@ -138,8 +170,29 @@ void FrameGraphicsItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*
         auto noMatchColor = brush().color();
         noMatchColor.setAlpha(50);
         painter->fillRect(rect(), noMatchColor);
-    } else { // default, when no search is running, or a sub-item is matched
-        painter->fillRect(rect(), brush());
+    } else {
+        // default, when no search is running, or a sub-item is matched
+        auto background = brush();
+
+        // give inline frames a slightly different background color
+        if (m_symbol.isInline) {
+            auto color = background.color();
+            if (qGray(pen().color().rgb()) < 128) {
+                color = color.lighter();
+            } else {
+                color = color.darker();
+            }
+            background.setColor(color);
+        }
+        painter->fillRect(rect(), background);
+
+        // give inline frames a border with the normal background color
+        if (m_symbol.isInline) {
+            const auto oldPen = painter->pen();
+            painter->setPen(QPen(brush().color(), 0.));
+            painter->drawRect(rect().adjusted(-1, -1, -1, -1));
+            painter->setPen(oldPen);
+        }
     }
 
     const QPen oldPen = painter->pen();
@@ -174,7 +227,7 @@ void FrameGraphicsItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*
     const auto symbolText = symbol.isEmpty() ? QObject::tr("?? [%1]").arg(binary) : symbol;
     painter->drawText(margin + rect().x(), rect().y(), width, height,
                       Qt::AlignVCenter | Qt::AlignLeft | Qt::TextSingleLine,
-                      option->fontMetrics.elidedText(symbolText, Qt::ElideRight, width));
+                      Util::elideSymbol(symbolText, option->fontMetrics, width));
 
     if (m_searchMatch == NoMatch) {
         painter->setPen(oldPen);
@@ -199,22 +252,37 @@ QString FrameGraphicsItem::description() const
 {
     // we build the tooltip text on demand, which is much faster than doing that for potentially thousands of items when
     // we load the data
-    qint64 totalCost = 0;
+    const FrameGraphicsRootItem* root = nullptr;
     {
         auto item = this;
         while (item->parentItem()) {
             item = static_cast<const FrameGraphicsItem*>(item->parentItem());
         }
-        totalCost = item->cost();
+        root = static_cast<const FrameGraphicsRootItem*>(item);
     }
-    const auto symbol = Util::formatSymbol(m_symbol);
-    if (!parentItem()) {
+
+    auto symbol = Util::formatSymbolExtended(m_symbol);
+    if (root == this) {
         return symbol;
     }
 
-    return i18nc("%1: aggregated sample costs, %2: relative number, %3: function label, %4: binary",
-                 "%1 (%2%) aggregated sample costs in %3 (%4) and below.", Data::Costs::formatCost(m_unit, m_cost),
-                 Util::formatCostRelative(m_cost, totalCost), symbol, m_symbol.binary);
+    switch (root->unit()) {
+    case Data::Costs::Unit::Unknown:
+        return i18nc("%1: aggregated sample costs, %2: relative number, %3: function label, %4: binary, %5: cost name",
+                     "%1 (%2%) aggregated %5 costs in %3 (%4) and below.",
+                     Data::Costs::formatCost(root->unit(), m_cost), Util::formatCostRelative(m_cost, root->cost()),
+                     symbol, m_symbol.binary, root->costName());
+    case Data::Costs::Unit::Tracepoint:
+        return i18nc("%1: number of tracepoint events, %2: relative number, %3: function label, %4: binary",
+                     "%1 (%2%) aggregated %5 events in %3 (%4) and below.",
+                     Data::Costs::formatCost(root->unit(), m_cost), Util::formatCostRelative(m_cost, root->cost()),
+                     symbol, m_symbol.binary, root->costName());
+    case Data::Costs::Unit::Time:
+        return i18nc("%1: elapsed time, %2: relative number, %3: function label, %4: binary",
+                     "%1 (%2%) aggregated %5 in %3 (%4) and below.", Data::Costs::formatCost(root->unit(), m_cost),
+                     Util::formatCostRelative(m_cost, root->cost()), symbol, m_symbol.binary, root->costName());
+    }
+    Q_UNREACHABLE();
 }
 
 void FrameGraphicsItem::setSearchMatchType(SearchMatchType matchType)
@@ -225,9 +293,22 @@ void FrameGraphicsItem::setSearchMatchType(SearchMatchType matchType)
     }
 }
 
+bool FrameGraphicsItem::isExternallyHovered() const
+{
+    return m_isExternallyHovered;
+}
+
+void FrameGraphicsItem::setIsExternallyHovered(bool externallyHovered)
+{
+    if (m_isExternallyHovered != externallyHovered) {
+        m_isExternallyHovered = externallyHovered;
+        update();
+    }
+}
+
 namespace {
 
-int rand(int max)
+int randInt(int max)
 {
     return max * QRandomGenerator::global()->generateDouble();
 }
@@ -237,7 +318,7 @@ int rand(int max)
  */
 Q_DECL_UNUSED QBrush memBrush()
 {
-    return QColor(0, 190 + rand(50), rand(210), 125);
+    return QColor(0, 190 + randInt(50), randInt(210), 125);
 }
 
 /**
@@ -245,7 +326,7 @@ Q_DECL_UNUSED QBrush memBrush()
  */
 QBrush hotBrush()
 {
-    return QColor(205 + rand(50), rand(230), rand(55), 125);
+    return QColor(205 + randInt(50), randInt(230), randInt(55), 125);
 }
 
 template<typename Generator>
@@ -287,8 +368,8 @@ QBrush brushBinary(const Data::Symbol& symbol)
 
 QBrush brushKernel(const Data::Symbol& symbol)
 {
-    static QBrush kernel(QColor(255, 0, 0, 125));
-    static QBrush user(QColor(0, 0, 255, 125));
+    static auto kernel = QBrush(QColor(255, 0, 0, 125));
+    static auto user = QBrush(QColor(0, 0, 255, 125));
 
     if (symbol.isKernel) {
         return kernel;
@@ -303,49 +384,71 @@ bool isInPathList(const QStringList& paths, const QString& subPath)
     return std::any_of(paths.cbegin(), paths.cend(), containsSubPath);
 }
 
-bool isSystemPath(const QString& path)
+struct BrushConfig
 {
-    return isInPathList(Settings::instance()->systemPaths(), path);
+    bool isSystemPath(const QString& path) const
+    {
+        return isInPathList(systemPaths, path);
+    }
+
+    bool isUserPath(const QString& path) const
+    {
+        return isInPathList(userPaths, path);
+    }
+
+    Settings::ColorScheme scheme;
+    QStringList systemPaths;
+    QStringList userPaths;
+};
+
+// construct brush config in main thread and query settings that then can be used in the background
+// without introducing data races
+BrushConfig brushConfig(Settings::ColorScheme scheme)
+{
+    return {scheme, Settings::instance()->systemPaths(), Settings::instance()->userPaths()};
 }
 
-bool isUserPath(const QString& path)
+QBrush brushSystem(const Data::Symbol& symbol, const BrushConfig& brushConfig)
 {
-    return isInPathList(Settings::instance()->userPaths(), path);
-}
+    static const auto system = QBrush(QColor(0, 125, 0, 125));
+    static const auto user = QBrush(QColor(200, 200, 0, 125));
+    static const auto unknown = QBrush(QColor(50, 50, 50, 125));
 
-QBrush brushSystem(const Data::Symbol& symbol)
-{
-    static QBrush system(QColor(0, 125, 0, 125));
-    static QBrush user(QColor(200, 200, 0, 125));
-    static QBrush unkown(QColor(50, 50, 50, 125));
-
-    // I have seen [ only on kernel calls
+    // remark lievenhey: I have seen [ only on kernel calls
     if (symbol.path.isEmpty() || symbol.path.startsWith(QLatin1Char('['))) {
-        return unkown;
-    } else if (isSystemPath(symbol.path)) {
-        if (isUserPath(symbol.path)) {
-            return user;
-        }
+        return unknown;
+    } else if (!brushConfig.isUserPath(symbol.path) && brushConfig.isSystemPath(symbol.path)) {
         return system;
     }
     return user;
 }
 
-QBrush brush(const Data::Symbol& entry, Settings::ColorScheme scheme)
+QBrush costRatioBrush(quint32 cost, quint32 totalCost)
 {
-    switch (scheme) {
+    // interpolate between red and yellow
+    // where yellow = 0% and red = 100%
+    const float ratio = (1 - static_cast<float>(cost) / totalCost);
+    const int hue = ratio * ratio * 60;
+    return QColor::fromHsv(hue, 230, 200, 125);
+}
+
+QBrush brush(const Data::Symbol& entry, const BrushConfig& brushConfig, quint32 cost = 0, quint32 totalCost = 1)
+{
+    switch (brushConfig.scheme) {
     case Settings::ColorScheme::Binary:
         return brushBinary(entry);
     case Settings::ColorScheme::Kernel:
         return brushKernel(entry);
     case Settings::ColorScheme::System:
-        return brushSystem(entry);
+        return brushSystem(entry, brushConfig);
     case Settings::ColorScheme::Default:
         return brushImpl(qHash(entry), BrushType::Hot);
+    case Settings::ColorScheme::CostRatio:
+        return costRatioBrush(cost, totalCost);
     case Settings::ColorScheme::NumColorSchemes:
         Q_UNREACHABLE();
     }
-    return QBrush();
+    return {};
 }
 
 /**
@@ -396,44 +499,44 @@ FrameGraphicsItem* findItemBySymbol(const QList<QGraphicsItem*>& items, const Da
  */
 template<typename Tree>
 void toGraphicsItems(const Data::Costs& costs, int type, const QVector<Tree>& data, FrameGraphicsItem* parent,
-                     const double costThreshold, bool collapseRecursion)
+                     const double costThreshold, const BrushConfig& brushConfig, bool collapseRecursion)
 {
     foreach (const auto& row, data) {
         if (collapseRecursion && !row.symbol.symbol.isEmpty() && row.symbol == parent->symbol()) {
             if (costs.cost(type, row.id) > costThreshold) {
-                toGraphicsItems(costs, type, row.children, parent, costThreshold, collapseRecursion);
+                toGraphicsItems(costs, type, row.children, parent, costThreshold, brushConfig, collapseRecursion);
             }
             continue;
         }
         auto item = findItemBySymbol(parent->childItems(), row.symbol);
         if (!item) {
-            item = new FrameGraphicsItem(costs.cost(type, row.id), costs.unit(type), row.symbol, parent);
+            item = new FrameGraphicsItem(costs.cost(type, row.id), row.symbol, parent);
             item->setPen(parent->pen());
-            item->setBrush(brush(row.symbol, Settings::instance()->colorScheme()));
+            item->setBrush(brush(row.symbol, brushConfig, item->cost(), costs.totalCost(type)));
         } else {
             item->setCost(item->cost() + costs.cost(type, row.id));
         }
         if (item->cost() > costThreshold) {
-            toGraphicsItems(costs, type, row.children, item, costThreshold, collapseRecursion);
+            toGraphicsItems(costs, type, row.children, item, costThreshold, brushConfig, collapseRecursion);
         }
     }
 }
 
 template<typename Tree>
 FrameGraphicsItem* parseData(const Data::Costs& costs, int type, const QVector<Tree>& topDownData, double costThreshold,
-                             bool collapseRecursion)
+                             const BrushConfig& brushConfig, bool collapseRecursion)
 {
     const auto totalCost = costs.totalCost(type);
 
-    KColorScheme scheme(QPalette::Active);
-    const QPen pen(scheme.foreground().color());
+    const auto scheme = KColorScheme(QPalette::Active);
+    const auto pen = QPen(scheme.foreground().color());
 
-    QString label = i18n("%1 aggregated %2 cost in total", costs.formatCost(type, totalCost), costs.typeName(type));
-    auto rootItem = new FrameGraphicsItem(totalCost, costs.unit(type), {label, {}});
+    const auto label = i18n("%1 aggregated %2 cost in total", costs.formatCost(type, totalCost), costs.typeName(type));
+    auto rootItem = new FrameGraphicsRootItem(totalCost, costs.unit(type), costs.typeName(type), label);
     rootItem->setBrush(scheme.background());
     rootItem->setPen(pen);
     toGraphicsItems(costs, type, topDownData, rootItem, static_cast<double>(totalCost) * costThreshold / 100.,
-                    collapseRecursion);
+                    brushConfig, collapseRecursion);
     return rootItem;
 }
 
@@ -456,7 +559,8 @@ SearchResults applySearch(FrameGraphicsItem* item, const QString& searchValue)
     }
 
     // recurse into the child items, we always need to update all items
-    for (auto* child : item->childItems()) {
+    const auto children = item->childItems();
+    for (auto* child : children) {
         auto* childFrame = static_cast<FrameGraphicsItem*>(child);
         auto childMatch = applySearch(childFrame, searchValue);
         if (result.matchType != DirectMatch
@@ -469,14 +573,79 @@ SearchResults applySearch(FrameGraphicsItem* item, const QString& searchValue)
     item->setSearchMatchType(result.matchType);
     return result;
 }
+
+// only apply positive matching, resetting is handled globally once before
+// this way we can correctly match multiple stacks
+bool hoverStack(FrameGraphicsItem* item, const QVector<Data::Symbol>& stack, int depth)
+{
+    if ((stack.size() - 1) == depth && item->symbol() == stack.constFirst()) {
+        item->setIsExternallyHovered(true);
+        return true;
+    } else if (stack.size() <= depth || item->symbol() != stack[stack.size() - 1 - depth]) {
+        return false;
+    }
+
+    const auto children = item->childItems();
+    for (auto* child : children) {
+        if (hoverStack(static_cast<FrameGraphicsItem*>(child), stack, depth + 1)) {
+            item->setIsExternallyHovered(true);
+            return true;
+        }
+    }
+
+    return false;
 }
 
-void updateFlameGraphColorScheme(FrameGraphicsItem* item, Settings::ColorScheme scheme)
+void resetIsExternallyHovered(FrameGraphicsItem* item)
 {
-    item->setBrush(brush(item->symbol(), scheme));
+    if (!item->isExternallyHovered()) {
+        // when nothing is hovered we don't need to recurse
+        return;
+    }
+    item->setIsExternallyHovered(false);
+    const auto children = item->childItems();
+    for (auto* child : children) {
+        resetIsExternallyHovered(static_cast<FrameGraphicsItem*>(child));
+    }
+}
+
+void hoverStacks(FrameGraphicsItem* rootItem, const QVector<QVector<Data::Symbol>>& stacks)
+{
+    auto matchStacks = [&stacks](QGraphicsItem* item) {
+        return std::any_of(stacks.begin(), stacks.end(), [item](const auto& stack) {
+            return hoverStack(static_cast<FrameGraphicsItem*>(item), stack, 0);
+        });
+    };
+
+    const auto children = rootItem->childItems();
+    const auto costAggregation = Settings::instance()->costAggregation();
+    const auto skipFirstLevel = costAggregation != Settings::CostAggregation::BySymbol;
+    for (auto* child : children) {
+        // reset everything first
+        resetIsExternallyHovered(static_cast<FrameGraphicsItem*>(child));
+
+        // then match all stacks
+        if (skipFirstLevel) {
+            // skip first level
+            const auto grandChildren = child->childItems();
+            bool anyMatched = false;
+            for (auto* grandChild : grandChildren) {
+                anyMatched |= matchStacks(grandChild);
+            }
+            static_cast<FrameGraphicsItem*>(child)->setIsExternallyHovered(anyMatched);
+        } else {
+            matchStacks(child);
+        }
+    }
+}
+}
+
+void updateFlameGraphColorScheme(FrameGraphicsItem* item, const BrushConfig& brushConfig, quint32 totalCost)
+{
+    item->setBrush(brush(item->symbol(), brushConfig, item->cost(), totalCost));
     const auto children = item->childItems();
     for (const auto& child : children) {
-        updateFlameGraphColorScheme(static_cast<FrameGraphicsItem*>(child), scheme);
+        updateFlameGraphColorScheme(static_cast<FrameGraphicsItem*>(child), brushConfig, totalCost);
     }
 }
 
@@ -487,8 +656,6 @@ FlameGraph::FlameGraph(QWidget* parent, Qt::WindowFlags flags)
     , m_view(new QGraphicsView(this))
     , m_displayLabel(new KSqueezedTextLabel(this))
     , m_searchResultsLabel(new QLabel(this))
-    , m_colorSchemeLabel(new QLabel(this))
-    , m_colorSchemeSelector(new QComboBox(this))
 {
     m_displayLabel->setTextElideMode(Qt::ElideRight);
     qRegisterMetaType<FrameGraphicsItem*>();
@@ -510,77 +677,171 @@ FlameGraph::FlameGraph(QWidget* parent, Qt::WindowFlags flags)
     m_view->setScene(m_scene);
     m_view->viewport()->installEventFilter(this);
     m_view->viewport()->setMouseTracking(true);
-    m_view->setFont(QFont(QStringLiteral("monospace")));
+    // fix for  QTBUG-105237 view->setFont does not update fontMetrics only the rendered font
+    m_scene->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
 
-    m_backButton = new QPushButton(this);
-    m_backButton->setIcon(QIcon::fromTheme(QStringLiteral("go-previous")));
-    m_backButton->setToolTip(QStringLiteral("Go back in symbol view history"));
-    m_forwardButton = new QPushButton(this);
-    m_forwardButton->setIcon(QIcon::fromTheme(QStringLiteral("go-next")));
-    m_forwardButton->setToolTip(QStringLiteral("Go forward in symbol view history"));
+    auto bottomUpAction = new CustomWidgetAction(
+        [this](QWidget* widget, QHBoxLayout* layout) {
+            auto bottomUpCheckbox = new QCheckBox(i18n("Bottom-Up View"), widget);
+            layout->addWidget(bottomUpCheckbox);
+            connect(this, &FlameGraph::uiResetRequested, bottomUpCheckbox,
+                    [bottomUpCheckbox]() { bottomUpCheckbox->setChecked(false); });
+            bottomUpCheckbox->setToolTip(i18n("Enable the bottom-up flame graph view. When this is unchecked, the "
+                                              "top-down view is enabled by default."));
+            bottomUpCheckbox->setChecked(m_showBottomUpData);
+            connect(bottomUpCheckbox, &QCheckBox::toggled, this, [this, bottomUpCheckbox] {
+                const auto showBottomUpData = bottomUpCheckbox->isChecked();
+                if (showBottomUpData == m_showBottomUpData) {
+                    return;
+                }
 
-    auto bottomUpCheckbox = new QCheckBox(i18n("Bottom-Up View"), this);
-    connect(this, &FlameGraph::uiResetRequested, bottomUpCheckbox,
-            [bottomUpCheckbox]() { bottomUpCheckbox->setChecked(false); });
-    bottomUpCheckbox->setToolTip(i18n(
-        "Enable the bottom-up flame graph view. When this is unchecked, the top-down view is enabled by default."));
-    bottomUpCheckbox->setChecked(m_showBottomUpData);
-    connect(bottomUpCheckbox, &QCheckBox::toggled, this, [this, bottomUpCheckbox] {
-        m_showBottomUpData = bottomUpCheckbox->isChecked();
-        showData();
-    });
+                m_showBottomUpData = showBottomUpData;
+                for (auto& stack : m_hoveredStacks) {
+                    std::reverse(stack.begin(), stack.end());
+                }
+                showData();
+            });
+        },
+        this);
 
-    auto collapseRecursionCheckbox = new QCheckBox(i18n("Collapse Recursion"), this);
-    connect(this, &FlameGraph::uiResetRequested, collapseRecursionCheckbox,
-            [collapseRecursionCheckbox]() { collapseRecursionCheckbox->setChecked(false); });
-    collapseRecursionCheckbox->setChecked(m_collapseRecursion);
-    collapseRecursionCheckbox->setToolTip(
-        i18n("Collapse stack frames for functions calling themselves. "
-             "When this is unchecked, recursive frames will be visualized separately."));
-    connect(collapseRecursionCheckbox, &QCheckBox::toggled, this, [this, collapseRecursionCheckbox] {
-        m_collapseRecursion = collapseRecursionCheckbox->isChecked();
-        showData();
-    });
+    m_costThreshold = DEFAULT_COST_THRESHOLD;
 
-    auto costThreshold = new QDoubleSpinBox(this);
-    costThreshold->setDecimals(2);
-    costThreshold->setMinimum(0);
-    costThreshold->setMaximum(99.90);
-    costThreshold->setPrefix(i18n("Cost Threshold: "));
-    costThreshold->setSuffix(QStringLiteral("%"));
-    costThreshold->setValue(DEFAULT_COST_THRESHOLD);
-    connect(this, &FlameGraph::uiResetRequested, costThreshold,
-            [costThreshold]() { costThreshold->setValue(DEFAULT_COST_THRESHOLD); });
-    costThreshold->setSingleStep(0.01);
-    costThreshold->setToolTip(
-        i18n("<qt>The cost threshold defines a fractional cut-off value. "
-             "Items with a relative cost below this value will not be shown in the flame graph. "
-             "This is done as an optimization to quickly generate graphs for large data sets with "
-             "low memory overhead. If you need more details, decrease the threshold value, or set it to zero.</qt>"));
-    connect(costThreshold, static_cast<void (QDoubleSpinBox::*)(double)>(&QDoubleSpinBox::valueChanged), this,
-            [this](double threshold) {
+    auto costThresholdAction = new CustomWidgetAction(
+        [this](QWidget* widget, QHBoxLayout* layout) {
+            auto costThreshold = new QDoubleSpinBox(widget);
+            costThreshold->setDecimals(2);
+            costThreshold->setMinimum(0);
+            costThreshold->setMaximum(99.90);
+            costThreshold->setPrefix(i18n("Cost Threshold: "));
+            costThreshold->setSuffix(QStringLiteral("%"));
+            costThreshold->setValue(m_costThreshold);
+            connect(this, &FlameGraph::uiResetRequested, costThreshold,
+                    [costThreshold]() { costThreshold->setValue(DEFAULT_COST_THRESHOLD); });
+            costThreshold->setSingleStep(0.01);
+            costThreshold->setToolTip(
+                i18n("<qt>The cost threshold defines a fractional cut-off value. "
+                     "Items with a relative cost below this value will not be shown in the flame graph. "
+                     "This is done as an optimization to quickly generate graphs for large data sets with "
+                     "low memory overhead. If you need more details, decrease the threshold value, or set it to "
+                     "zero.</qt>"));
+
+            connect(costThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double threshold) {
                 m_costThreshold = threshold;
                 showData();
             });
+            layout->addWidget(costThreshold);
+        },
+        this);
 
-    m_searchInput = new QLineEdit(this);
-    m_searchInput->setPlaceholderText(i18n("Search..."));
-    m_searchInput->setToolTip(i18n("<qt>Search the flame graph for a symbol.</qt>"));
-    m_searchInput->setClearButtonEnabled(true);
-    connect(m_searchInput, &QLineEdit::textChanged, this, &FlameGraph::setSearchValue);
-    connect(this, &FlameGraph::uiResetRequested, this, [this]() { m_searchInput->clear(); });
+    auto collapseRecursionAction = new CustomWidgetAction(
+        [this](QWidget* widget, QHBoxLayout* layout) {
+            auto checkbox = new QCheckBox(tr("Collapse Recursion"), widget);
+            checkbox->setChecked(m_collapseRecursion);
+            layout->addWidget(checkbox);
 
-    auto controls = new QWidget(this);
-    controls->setLayout(new QHBoxLayout);
-    controls->layout()->addWidget(m_backButton);
-    controls->layout()->addWidget(m_forwardButton);
-    controls->layout()->addWidget(m_costSource);
-    controls->layout()->addWidget(bottomUpCheckbox);
-    controls->layout()->addWidget(collapseRecursionCheckbox);
-    controls->layout()->addWidget(costThreshold);
-    controls->layout()->addWidget(m_searchInput);
-    controls->layout()->addWidget(m_colorSchemeLabel);
-    controls->layout()->addWidget(m_colorSchemeSelector);
+            connect(checkbox, &QCheckBox::clicked, widget, [this](bool checked) {
+                m_collapseRecursion = checked;
+                showData();
+            });
+        },
+        this);
+
+    auto costAggregation = new CustomWidgetAction(
+        [](QWidget* widget, QHBoxLayout* layout) {
+            auto costAggregationLabel = new QLabel(tr("Aggregate cost by:"), widget);
+            layout->addWidget(costAggregationLabel);
+
+            auto costAggregation = new QComboBox(widget);
+            ResultsUtil::setupResultsAggregation(costAggregation);
+            layout->addWidget(costAggregation);
+        },
+        this);
+
+    auto colorSchemeSelector = new CustomWidgetAction(
+        [this](QWidget* widget, QHBoxLayout* layout) {
+            auto label = new QLabel(tr("Color Scheme:"), widget);
+            layout->addWidget(label);
+
+            auto comboBox = new QComboBox(widget);
+            layout->addWidget(comboBox);
+
+            comboBox->addItem(tr("Default"), QVariant::fromValue(Settings::ColorScheme::Default));
+            comboBox->addItem(tr("Binary"), QVariant::fromValue(Settings::ColorScheme::Binary));
+            comboBox->addItem(tr("Kernel"), QVariant::fromValue(Settings::ColorScheme::Kernel));
+            comboBox->addItem(tr("System"), QVariant::fromValue(Settings::ColorScheme::System));
+            comboBox->addItem(tr("Cost Ratio"), QVariant::fromValue(Settings::ColorScheme::CostRatio));
+
+            auto setColorScheme = [this](Settings::ColorScheme scheme) {
+                Settings::instance()->setColorScheme(scheme);
+
+                if (m_rootItem) {
+                    const auto children = m_rootItem->childItems();
+                    // don't recolor the root item
+                    for (const auto& child : children) {
+                        updateFlameGraphColorScheme(static_cast<FrameGraphicsItem*>(child), brushConfig(scheme),
+                                                    m_rootItem->cost());
+                    }
+                }
+            };
+
+            connect(comboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [comboBox, setColorScheme] {
+                setColorScheme(comboBox->currentData().value<Settings::ColorScheme>());
+            });
+
+            connect(Settings::instance(), &Settings::pathsChanged, this, [setColorScheme] {
+                if (Settings::instance()->colorScheme() == Settings::ColorScheme::System) {
+                    // setColorScheme triggers a redraw
+                    // we only need to redraw the flamegraph if the current color scheme is affected by the changed
+                    // paths
+                    setColorScheme(Settings::ColorScheme::System);
+                }
+            });
+        },
+        this);
+
+    auto searchInput = new CustomWidgetAction(
+        [this](QWidget* widget, QHBoxLayout* layout) {
+            auto searchInput = new QLineEdit(widget);
+            searchInput->setMinimumWidth(200);
+            layout->addWidget(searchInput);
+
+            searchInput->setPlaceholderText(i18n("Search..."));
+            searchInput->setToolTip(i18n("<qt>Search the flame graph for a symbol.</qt>"));
+            searchInput->setClearButtonEnabled(true);
+            connect(searchInput, &QLineEdit::textChanged, this, &FlameGraph::setSearchValue);
+            connect(this, &FlameGraph::uiResetRequested, this, [this, searchInput] {
+                m_search.clear();
+                searchInput->clear();
+            });
+        },
+        this);
+
+    m_backAction = KStandardAction::back(this, &FlameGraph::navigateBack, this);
+    m_backAction->setToolTip(QStringLiteral("Go back in symbol view history"));
+    m_forwardAction = KStandardAction::forward(this, &FlameGraph::navigateForward, this);
+    m_forwardAction->setToolTip(QStringLiteral("Go forward in symbol view history"));
+
+    m_resetAction = new QAction(QIcon::fromTheme(QStringLiteral("go-first")), tr("Reset View"), this);
+    m_resetAction->setShortcut(tr("Escape"));
+    connect(m_resetAction, &QAction::triggered, this, [this]() { selectItem(0); });
+
+    // use a QToolBar to automatically hide widgets in a menu that don't fit into the window
+    auto controls = new QToolBar(this);
+    controls->layout()->setContentsMargins(0, 0, 0, 0);
+
+    // these control widgets can stay as they are, since they should always be visible
+    controls->addAction(m_resetAction);
+    controls->addAction(m_backAction);
+    controls->addAction(m_forwardAction);
+    controls->addWidget(m_costSource);
+
+    // these can be hidden as necessary
+    controls->addAction(searchInput);
+    controls->addAction(costAggregation);
+    controls->addAction(colorSchemeSelector);
+    controls->addAction(bottomUpAction);
+    controls->addAction(collapseRecursionAction);
+    controls->addAction(costThresholdAction);
 
     m_displayLabel->setWordWrap(true);
     m_displayLabel->setTextInteractionFlags(m_displayLabel->textInteractionFlags() | Qt::TextSelectableByMouse);
@@ -597,53 +858,31 @@ FlameGraph::FlameGraph(QWidget* parent, Qt::WindowFlags flags)
     layout()->addWidget(m_displayLabel);
     layout()->addWidget(m_searchResultsLabel);
 
-    m_backAction = KStandardAction::back(this, SLOT(navigateBack()), this);
     addAction(m_backAction);
-    connect(m_backButton, &QPushButton::released, m_backAction, &QAction::trigger);
-
-    m_forwardAction = KStandardAction::forward(this, SLOT(navigateForward()), this);
     addAction(m_forwardAction);
-    connect(m_forwardButton, &QPushButton::released, m_forwardAction, &QAction::trigger);
-
-    m_resetAction = new QAction(QIcon::fromTheme(QStringLiteral("go-first")), tr("Reset View"), this);
-    m_resetAction->setShortcut(Qt::Key_Escape);
-    connect(m_resetAction, &QAction::triggered, this, [this]() { selectItem(0); });
     addAction(m_resetAction);
     updateNavigationActions();
-
-    m_colorSchemeLabel->setText(tr("Color Scheme:"));
-
-    m_colorSchemeSelector->addItem(tr("Default"), QVariant::fromValue(Settings::ColorScheme::Default));
-    m_colorSchemeSelector->addItem(tr("Binary"), QVariant::fromValue(Settings::ColorScheme::Binary));
-    m_colorSchemeSelector->addItem(tr("Kernel"), QVariant::fromValue(Settings::ColorScheme::Kernel));
-    m_colorSchemeSelector->addItem(tr("System"), QVariant::fromValue(Settings::ColorScheme::System));
-
-    auto setColorScheme = [this](Settings::ColorScheme scheme) {
-        Settings::instance()->setColorScheme(scheme);
-
-        if (m_rootItem) {
-            const auto children = m_rootItem->childItems();
-            // don't recolor the root item
-            for (const auto& child : children) {
-                updateFlameGraphColorScheme(static_cast<FrameGraphicsItem*>(child), scheme);
-            }
-        }
-    };
-
-    connect(m_colorSchemeSelector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, setColorScheme] {
-        setColorScheme(m_colorSchemeSelector->currentData().value<Settings::ColorScheme>());
-    });
-
-    connect(Settings::instance(), &Settings::pathsChanged, this, [setColorScheme] {
-        if (Settings::instance()->colorScheme() == Settings::ColorScheme::System) {
-            // setColorScheme triggers a redraw
-            // we only need to redraw the flamegraph if the current color scheme is affected by the changed paths
-            setColorScheme(Settings::ColorScheme::System);
-        }
-    });
 }
 
 FlameGraph::~FlameGraph() = default;
+
+void FlameGraph::setHoveredStacks(const QVector<QVector<Data::Symbol>>& hoveredStacks)
+{
+    if (m_hoveredStacks == hoveredStacks) {
+        return;
+    }
+
+    m_hoveredStacks = hoveredStacks;
+    if (m_showBottomUpData) {
+        for (auto& stack : m_hoveredStacks) {
+            std::reverse(stack.begin(), stack.end());
+        }
+    }
+
+    if (m_rootItem) {
+        hoverStacks(m_rootItem, m_hoveredStacks);
+    }
+}
 
 void FlameGraph::setFilterStack(FilterAndZoomStack* filterStack)
 {
@@ -652,10 +891,10 @@ void FlameGraph::setFilterStack(FilterAndZoomStack* filterStack)
 
 bool FlameGraph::eventFilter(QObject* object, QEvent* event)
 {
-    bool ret = QObject::eventFilter(object, event);
+    const auto ret = QObject::eventFilter(object, event);
 
     if (event->type() == QEvent::MouseButtonRelease) {
-        QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+        auto* mouseEvent = static_cast<QMouseEvent*>(event);
         if (mouseEvent->button() == Qt::LeftButton) {
             auto item = static_cast<FrameGraphicsItem*>(m_view->itemAt(mouseEvent->pos()));
             if (item && item != m_selectionHistory.at(m_selectedItem)) {
@@ -673,7 +912,7 @@ bool FlameGraph::eventFilter(QObject* object, QEvent* event)
             m_forwardAction->trigger();
         }
     } else if (event->type() == QEvent::MouseMove) {
-        QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+        auto* mouseEvent = static_cast<QMouseEvent*>(event);
         auto item = static_cast<FrameGraphicsItem*>(m_view->itemAt(mouseEvent->pos()));
         setTooltipItem(item);
     } else if (event->type() == QEvent::Leave) {
@@ -688,7 +927,7 @@ bool FlameGraph::eventFilter(QObject* object, QEvent* event)
         }
         updateTooltip();
     } else if (event->type() == QEvent::ContextMenu) {
-        QContextMenuEvent* contextEvent = static_cast<QContextMenuEvent*>(event);
+        auto* contextEvent = static_cast<QContextMenuEvent*>(event);
         auto item = static_cast<FrameGraphicsItem*>(m_view->itemAt(m_view->mapFromGlobal(contextEvent->globalPos())));
 
         QMenu contextMenu;
@@ -698,10 +937,12 @@ bool FlameGraph::eventFilter(QObject* object, QEvent* event)
                     [this, item]() { emit jumpToCallerCallee(item->symbol()); });
             auto* openEditorAction = contextMenu.addAction(tr("Open in Editor"));
             connect(openEditorAction, &QAction::triggered, this, [this, item]() { emit openEditor(item->symbol()); });
+            openEditorAction->setEnabled(item->symbol().isValid());
             contextMenu.addSeparator();
             auto* viewDisassembly = contextMenu.addAction(tr("Disassembly"));
             connect(viewDisassembly, &QAction::triggered, this,
                     [this, item]() { emit jumpToDisassembly(item->symbol()); });
+            viewDisassembly->setEnabled(item->symbol().canDisassemble());
 
             auto* copy = contextMenu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), tr("Copy"));
             connect(copy, &QAction::triggered, this, [item]() { qApp->clipboard()->setText(item->description()); });
@@ -732,22 +973,31 @@ void FlameGraph::setTopDownData(const Data::TopDownResults& topDownData)
 {
     m_topDownData = topDownData;
 
-    if (isVisible()) {
-        showData();
-    } else {
-        setData(nullptr);
-    }
+    if (!m_showBottomUpData)
+        rebuild();
 }
 
 void FlameGraph::setBottomUpData(const Data::BottomUpResults& bottomUpData)
 {
     m_bottomUpData = bottomUpData;
+    m_topDownData = {};
 
     disconnect(m_costSource, nullptr, this, nullptr);
     ResultsUtil::fillEventSourceComboBox(m_costSource, bottomUpData.costs,
-                                         ki18n("Show a flame graph over the aggregated %1 sample costs."));
+                                         tr("Show a flame graph over the aggregated %1 sample costs."));
     connect(m_costSource, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
             &FlameGraph::showData);
+
+    rebuild();
+}
+
+void FlameGraph::rebuild()
+{
+    if (isVisible()) {
+        showData();
+    } else {
+        setData(nullptr);
+    }
 }
 
 void FlameGraph::clear()
@@ -784,7 +1034,8 @@ void FlameGraph::saveSvg(const QString& fileName) const
         generator.setTitle(tr("Top Down FlameGraph"));
     const auto costType = m_bottomUpData.costs.typeName(m_costSource->currentData().value<int>());
     generator.setDescription(tr("Cost type: %1, cost threshold: %2\n%3")
-                                 .arg(costType, QString::number(m_costThreshold), m_displayLabel->text()));
+                                 .arg(costType, QString::number(m_costThreshold), m_displayLabel->text())
+                                 .toHtmlEscaped());
 
     const auto oldPen = m_rootItem->pen();
     const auto oldBrush = m_rootItem->brush();
@@ -813,19 +1064,23 @@ void FlameGraph::showData()
     using namespace ThreadWeaver;
     auto bottomUpData = m_bottomUpData;
     auto topDownData = m_topDownData;
-    bool collapseRecursion = m_collapseRecursion;
+    const auto collapseRecursion = m_collapseRecursion;
     auto type = m_costSource->currentData().value<int>();
     auto threshold = m_costThreshold;
-    stream() << make_job([showBottomUpData, bottomUpData, topDownData, type, threshold, collapseRecursion, this]() {
-        FrameGraphicsItem* parsedData = nullptr;
-        if (showBottomUpData) {
-            parsedData = parseData(bottomUpData.costs, type, bottomUpData.root.children, threshold, collapseRecursion);
-        } else {
-            parsedData =
-                parseData(topDownData.inclusiveCosts, type, topDownData.root.children, threshold, collapseRecursion);
-        }
-        QMetaObject::invokeMethod(this, "setData", Qt::QueuedConnection, Q_ARG(FrameGraphicsItem*, parsedData));
-    });
+    auto brushConfig = ::brushConfig(Settings::instance()->colorScheme());
+
+    stream() << make_job(
+        [showBottomUpData, bottomUpData, topDownData, type, threshold, brushConfig, collapseRecursion, this]() {
+            FrameGraphicsItem* parsedData = nullptr;
+            if (showBottomUpData) {
+                parsedData = parseData(bottomUpData.costs, type, bottomUpData.root.children, threshold, brushConfig,
+                                       collapseRecursion);
+            } else {
+                parsedData = parseData(topDownData.inclusiveCosts, type, topDownData.root.children, threshold,
+                                       brushConfig, collapseRecursion);
+            }
+            QMetaObject::invokeMethod(this, "setData", Qt::QueuedConnection, Q_ARG(FrameGraphicsItem*, parsedData));
+        });
     updateNavigationActions();
 }
 
@@ -843,6 +1098,16 @@ void FlameGraph::setTooltipItem(const FrameGraphicsItem* item)
 
     if (item) {
         emit selectSymbol(item->symbol());
+
+        const auto costAggregation = Settings::instance()->costAggregation();
+        const auto skipFirstLevel = costAggregation != Settings::CostAggregation::BySymbol;
+        QVector<Data::Symbol> stack;
+        stack.reserve(32);
+        while (item && (item != m_rootItem && (!skipFirstLevel || item->parentItem() != m_rootItem))) {
+            stack.append(item->symbol());
+            item = static_cast<const FrameGraphicsItem*>(item->parentItem());
+        }
+        emit selectStack(stack, m_showBottomUpData);
     }
 }
 
@@ -874,13 +1139,18 @@ void FlameGraph::setData(FrameGraphicsItem* rootItem)
     rootItem->setRect(0, 0, 800, m_view->fontMetrics().height() + 4);
     m_scene->addItem(rootItem);
 
-    if (!m_searchInput->text().isEmpty()) {
-        setSearchValue(m_searchInput->text());
+    if (!m_search.isEmpty()) {
+        setSearchValue(m_search);
+    }
+    if (!m_hoveredStacks.isEmpty()) {
+        hoverStacks(rootItem, m_hoveredStacks);
     }
 
     if (isVisible()) {
         selectItem(m_rootItem);
     }
+
+    emit canConvertToImageChanged();
 }
 
 void FlameGraph::selectItem(int item)
@@ -934,6 +1204,8 @@ void FlameGraph::setSearchValue(const QString& value)
         return;
     }
 
+    m_search = value;
+
     auto match = applySearch(m_rootItem, value);
 
     if (value.isEmpty()) {
@@ -967,6 +1239,9 @@ void FlameGraph::updateNavigationActions()
     m_backAction->setEnabled(hasItems);
     m_forwardAction->setEnabled(isNotLastItem);
     m_resetAction->setEnabled(hasItems);
-    m_backButton->setEnabled(hasItems);
-    m_forwardButton->setEnabled(isNotLastItem);
+}
+
+bool FlameGraph::canConvertToImage() const
+{
+    return m_rootItem != nullptr;
 }

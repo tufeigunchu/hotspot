@@ -1,74 +1,99 @@
 /*
-  settingsdialog.cpp
+    SPDX-FileCopyrightText: Petr Lyapidevskiy <p.lyapidevskiy@nips.ru>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Petr Lyapidevskiy <p.lyapidevskiy@nips.ru>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "settingsdialog.h"
-#include "ui_flamegraphsettings.h"
-#include "ui_settingsdialog.h"
 
-#include <KComboBox>
-#include <KUrlRequester>
-#include <kconfiggroup.h>
-#include <ksharedconfig.h>
-#include <QKeyEvent>
-#include <QLineEdit>
-#include <settings.h>
-#include <QListView>
+#include "ui_callgraphsettingspage.h"
+#include "ui_debuginfodpage.h"
+#include "ui_disassemblysettingspage.h"
+#include "ui_flamegraphsettingspage.h"
+#include "ui_perfsettingspage.h"
+#include "ui_unwindsettingspage.h"
 
 #include "multiconfigwidget.h"
+#include "settings.h"
+
+#include <KComboBox>
+#include <KConfigGroup>
+#include <KSharedConfig>
+#include <KUrlRequester>
+
+#include <QKeyEvent>
+#include <QLineEdit>
+#include <QListView>
+
+#include <hotspot-config.h>
 
 namespace {
 KConfigGroup config()
 {
-    return KSharedConfig::openConfig()->group("PerfPaths");
+    return KSharedConfig::openConfig()->group(QStringLiteral("PerfPaths"));
+}
+
+QPushButton* setupMultiPath(KEditListWidget* listWidget, QLabel* buddy, QWidget* previous)
+{
+    auto editor = new KUrlRequester(listWidget);
+    editor->setPlaceholderText(QObject::tr("auto-detect"));
+    editor->setMode(KFile::LocalOnly | KFile::Directory | KFile::ExistingOnly);
+    buddy->setBuddy(editor);
+    listWidget->setCustomEditor(editor->customEditor());
+    QWidget::setTabOrder(previous, editor);
+    QWidget::setTabOrder(editor, listWidget->listView());
+    QWidget::setTabOrder(listWidget->listView(), listWidget->addButton());
+    QWidget::setTabOrder(listWidget->addButton(), listWidget->removeButton());
+    QWidget::setTabOrder(listWidget->removeButton(), listWidget->upButton());
+    QWidget::setTabOrder(listWidget->upButton(), listWidget->downButton());
+    return listWidget->downButton();
+}
+
+QIcon icon()
+{
+    static const auto icon = QIcon::fromTheme(QStringLiteral("preferences-system-windows-behavior"));
+    return icon;
 }
 }
 
 SettingsDialog::SettingsDialog(QWidget* parent)
     : KPageDialog(parent)
-    , unwindPage(new Ui::SettingsDialog)
-    , flamegraphPage(new Ui::FlamegraphSettings)
+    , perfPage(new Ui::PerfSettingsPage)
+    , unwindPage(new Ui::UnwindSettingsPage)
+    , flamegraphPage(new Ui::FlamegraphSettingsPage)
+    , debuginfodPage(new Ui::DebuginfodPage)
+    , disassemblyPage(new Ui::DisassemblySettingsPage)
+#if KGraphViewerPart_FOUND
+    , callgraphPage(new Ui::CallgraphSettingsPage)
+#endif
 {
+    addPerfSettingsPage();
     addPathSettingsPage();
     addFlamegraphPage();
+    addDebuginfodPage();
+#if KGraphViewerPart_FOUND
+    addCallgraphPage();
+#endif
+    addSourcePathPage();
 }
 
 SettingsDialog::~SettingsDialog() = default;
 
-void SettingsDialog::initSettings(const QString& configName)
+void SettingsDialog::initSettings()
 {
-    m_configs->selectConfig(configName);
+    const auto configName = Settings::instance()->lastUsedEnvironment();
+    if (!configName.isEmpty()) {
+        m_configs->selectConfig(configName);
+    }
 }
 
-void SettingsDialog::initSettings(const QString &sysroot, const QString &appPath, const QString &extraLibPaths,
-                                  const QString &debugPaths, const QString &kallsyms, const QString &arch,
-                                  const QString &objdump)
+void SettingsDialog::initSettings(const QString& sysroot, const QString& appPath, const QString& extraLibPaths,
+                                  const QString& debugPaths, const QString& kallsyms, const QString& arch,
+                                  const QString& objdump)
 {
-    auto fromPathString = [](KEditListWidget* listWidget, const QString &string)
-    {
+    auto fromPathString = [](KEditListWidget* listWidget, const QString& string) {
         listWidget->setItems(string.split(QLatin1Char(':'), Qt::SkipEmptyParts));
     };
     fromPathString(unwindPage->extraLibraryPaths, extraLibPaths);
@@ -117,7 +142,7 @@ QString SettingsDialog::kallsyms() const
 
 QString SettingsDialog::arch() const
 {
-    QString sArch = unwindPage->comboBoxArchitecture->currentText();
+    const auto sArch = unwindPage->comboBoxArchitecture->currentText();
     return (sArch == QLatin1String("auto-detect")) ? QString() : sArch;
 }
 
@@ -126,33 +151,40 @@ QString SettingsDialog::objdump() const
     return unwindPage->lineEditObjdump->text();
 }
 
+QString SettingsDialog::perfMapPath() const
+{
+    return unwindPage->lineEditPerfMapPath->text();
+}
+
+void SettingsDialog::addPerfSettingsPage()
+{
+    auto page = new QWidget(this);
+    auto item = addPage(page, tr("Perf"));
+    item->setIcon(icon());
+
+    perfPage->setupUi(page);
+
+    connect(this, &KPageDialog::accepted, this, [this]() {
+        auto settings = Settings::instance();
+        settings->setPerfPath(perfPage->perfPathEdit->url().toLocalFile());
+    });
+
+    perfPage->perfPathEdit->setUrl(QUrl::fromLocalFile(Settings::instance()->perfPath()));
+}
+
 void SettingsDialog::addPathSettingsPage()
 {
     auto page = new QWidget(this);
     auto item = addPage(page, tr("Unwinding"));
     item->setHeader(tr("Unwind Options"));
-    item->setIcon(QIcon::fromTheme(QStringLiteral("preferences-system-windows-behavior")));
+    item->setIcon(icon());
 
     unwindPage->setupUi(page);
 
-    auto setupMultiPath = [](KEditListWidget* listWidget, QLabel* buddy, QWidget* previous) {
-        auto editor = new KUrlRequester(listWidget);
-        editor->setPlaceholderText(tr("auto-detect"));
-        editor->setMode(KFile::LocalOnly | KFile::Directory | KFile::ExistingOnly);
-        buddy->setBuddy(editor);
-        listWidget->setCustomEditor(editor->customEditor());
-        QWidget::setTabOrder(previous, editor);
-        QWidget::setTabOrder(editor, listWidget->listView());
-        QWidget::setTabOrder(listWidget->listView(), listWidget->addButton());
-        QWidget::setTabOrder(listWidget->addButton(), listWidget->removeButton());
-        QWidget::setTabOrder(listWidget->removeButton(), listWidget->upButton());
-        QWidget::setTabOrder(listWidget->upButton(), listWidget->downButton());
-        return listWidget->downButton();
-    };
     auto lastExtraLibsWidget = setupMultiPath(unwindPage->extraLibraryPaths, unwindPage->extraLibraryPathsLabel,
                                               unwindPage->lineEditApplicationPath);
     setupMultiPath(unwindPage->debugPaths, unwindPage->debugPathsLabel, lastExtraLibsWidget);
-    
+
     auto* label = new QLabel(this);
     label->setText(tr("Config:"));
 
@@ -189,7 +221,8 @@ void SettingsDialog::addPathSettingsPage()
 
     connect(this, &KPageDialog::accepted, this, [this] { m_configs->updateCurrentConfig(); });
 
-    for (auto field : {unwindPage->lineEditSysroot, unwindPage->lineEditApplicationPath, unwindPage->lineEditKallsyms, unwindPage->lineEditObjdump}) {
+    for (auto field : {unwindPage->lineEditSysroot, unwindPage->lineEditApplicationPath, unwindPage->lineEditKallsyms,
+                       unwindPage->lineEditObjdump}) {
         connect(field, &KUrlRequester::textEdited, m_configs, &MultiConfigWidget::updateCurrentConfig);
         connect(field, &KUrlRequester::urlSelected, m_configs, &MultiConfigWidget::updateCurrentConfig);
     }
@@ -198,7 +231,8 @@ void SettingsDialog::addPathSettingsPage()
             &MultiConfigWidget::updateCurrentConfig);
 
     connect(unwindPage->debugPaths, &KEditListWidget::changed, m_configs, &MultiConfigWidget::updateCurrentConfig);
-    connect(unwindPage->extraLibraryPaths, &KEditListWidget::changed, m_configs, &MultiConfigWidget::updateCurrentConfig);
+    connect(unwindPage->extraLibraryPaths, &KEditListWidget::changed, m_configs,
+            &MultiConfigWidget::updateCurrentConfig);
 }
 
 void SettingsDialog::keyPressEvent(QKeyEvent* event)
@@ -216,23 +250,9 @@ void SettingsDialog::addFlamegraphPage()
     auto page = new QWidget(this);
     auto item = addPage(page, tr("Flamegraph"));
     item->setHeader(tr("Flamegraph Options"));
-    item->setIcon(QIcon::fromTheme(QStringLiteral("preferences-system-windows-behavior")));
+    item->setIcon(icon());
 
     flamegraphPage->setupUi(page);
-
-    auto setupMultiPath = [](KEditListWidget* listWidget, QLabel* buddy, QWidget* previous) {
-        auto editor = new KUrlRequester(listWidget);
-        editor->setMode(KFile::LocalOnly | KFile::Directory | KFile::ExistingOnly);
-        buddy->setBuddy(editor);
-        listWidget->setCustomEditor(editor->customEditor());
-        QWidget::setTabOrder(previous, editor);
-        QWidget::setTabOrder(editor, listWidget->listView());
-        QWidget::setTabOrder(listWidget->listView(), listWidget->addButton());
-        QWidget::setTabOrder(listWidget->addButton(), listWidget->removeButton());
-        QWidget::setTabOrder(listWidget->removeButton(), listWidget->upButton());
-        QWidget::setTabOrder(listWidget->upButton(), listWidget->downButton());
-        return listWidget->downButton();
-    };
 
     auto lastUserPath = setupMultiPath(flamegraphPage->userPaths, flamegraphPage->userPathsLabel, nullptr);
     setupMultiPath(flamegraphPage->systemPaths, flamegraphPage->systemPathsLabel, lastUserPath);
@@ -249,5 +269,78 @@ void SettingsDialog::addFlamegraphPage()
 
     connect(buttonBox(), &QDialogButtonBox::accepted, this, [this] {
         Settings::instance()->setPaths(flamegraphPage->userPaths->items(), flamegraphPage->systemPaths->items());
+    });
+}
+
+void SettingsDialog::addDebuginfodPage()
+{
+    auto page = new QWidget(this);
+    auto item = addPage(page, tr("debuginfod"));
+    item->setHeader(tr("debuginfod Urls"));
+    item->setIcon(icon());
+
+    debuginfodPage->setupUi(page);
+
+    debuginfodPage->urls->insertStringList(Settings::instance()->debuginfodUrls());
+
+    connect(Settings::instance(), &Settings::debuginfodUrlsChanged, this, [this] {
+        debuginfodPage->urls->clear();
+        debuginfodPage->urls->insertStringList(Settings::instance()->debuginfodUrls());
+    });
+
+    connect(buttonBox(), &QDialogButtonBox::accepted, this,
+            [this] { Settings::instance()->setDebuginfodUrls(debuginfodPage->urls->items()); });
+}
+
+void SettingsDialog::addCallgraphPage()
+{
+    auto page = new QWidget(this);
+    auto item = addPage(page, tr("Callgraph"));
+    item->setHeader(tr("Callgraph Settings"));
+    item->setIcon(icon());
+
+    callgraphPage->setupUi(page);
+
+    connect(Settings::instance(), &Settings::callgraphChanged, this, [this] {
+        auto settings = Settings::instance();
+        callgraphPage->parentSpinBox->setValue(settings->callgraphParentDepth());
+        callgraphPage->childSpinBox->setValue(settings->callgraphChildDepth());
+        callgraphPage->currentFunctionColor->setColor(settings->callgraphActiveColor());
+        callgraphPage->functionColor->setColor(settings->callgraphColor());
+    });
+
+    connect(buttonBox(), &QDialogButtonBox::accepted, this, [this] {
+        auto settings = Settings::instance();
+        settings->setCallgraphParentDepth(callgraphPage->parentSpinBox->value());
+        settings->setCallgraphChildDepth(callgraphPage->childSpinBox->value());
+        settings->setCallgraphColors(callgraphPage->currentFunctionColor->color().name(),
+                                     callgraphPage->functionColor->color().name());
+    });
+}
+
+void SettingsDialog::addSourcePathPage()
+{
+    auto page = new QWidget(this);
+    auto item = addPage(page, tr("Disassembly"));
+    item->setHeader(tr("Disassembly Settings"));
+    item->setIcon(QIcon::fromTheme(QStringLiteral("preferences-system-windows-behavior")));
+
+    disassemblyPage->setupUi(page);
+
+    auto settings = Settings::instance();
+
+    const auto colon = QLatin1Char(':');
+    connect(settings, &Settings::sourceCodePathsChanged, this,
+            [this, colon](const QString& paths) { disassemblyPage->sourcePaths->setItems(paths.split(colon)); });
+
+    setupMultiPath(disassemblyPage->sourcePaths, disassemblyPage->label, buttonBox()->button(QDialogButtonBox::Ok));
+
+    disassemblyPage->showBranches->setChecked(settings->showBranches());
+    disassemblyPage->showHexdump->setChecked(settings->showHexdump());
+
+    connect(buttonBox(), &QDialogButtonBox::accepted, this, [this, colon, settings] {
+        settings->setSourceCodePaths(disassemblyPage->sourcePaths->items().join(colon));
+        settings->setShowBranches(disassemblyPage->showBranches->isChecked());
+        settings->setShowHexdump(disassemblyPage->showHexdump->isChecked());
     });
 }

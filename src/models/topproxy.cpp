@@ -1,28 +1,8 @@
 /*
-  topproxy.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "topproxy.h"
@@ -32,8 +12,9 @@
 TopProxy::TopProxy(QObject* parent)
     : QSortFilterProxyModel(parent)
     , m_costColumn(BottomUpModel::InitialSortColumn)
+    , m_numBaseColumns(BottomUpModel::NUM_BASE_COLUMNS)
 {
-    sort(2, Qt::DescendingOrder);
+    sort(m_costColumn, Qt::DescendingOrder);
     setSortRole(AbstractTreeModel::SortRole);
 }
 
@@ -42,6 +23,13 @@ TopProxy::~TopProxy() = default;
 void TopProxy::setCostColumn(int costColumn)
 {
     m_costColumn = costColumn;
+    invalidate();
+    sort(m_costColumn, Qt::DescendingOrder);
+}
+
+void TopProxy::setNumBaseColumns(int numBaseColumns)
+{
+    m_numBaseColumns = numBaseColumns;
     invalidate();
 }
 
@@ -66,5 +54,5 @@ bool TopProxy::filterAcceptsRow(int source_row, const QModelIndex& source_parent
 
 bool TopProxy::filterAcceptsColumn(int source_column, const QModelIndex& /*source_parent*/) const
 {
-    return source_column < BottomUpModel::NUM_BASE_COLUMNS || source_column == m_costColumn;
+    return source_column < m_numBaseColumns || source_column == m_costColumn;
 }

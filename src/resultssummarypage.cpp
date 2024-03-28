@@ -1,28 +1,9 @@
 /*
-  resultssummarypage.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "resultssummarypage.h"
@@ -39,21 +20,20 @@
 #include "resultsutil.h"
 #include "util.h"
 
-#include "models/callercalleemodel.h"
-#include "models/costdelegate.h"
-#include "models/hashmodel.h"
 #include "models/topproxy.h"
 #include "models/treemodel.h"
 
-ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfParser* parser, QWidget* parent)
+ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfParser* parser,
+                                       CostContextMenu* contextMenu, QWidget* parent)
     : QWidget(parent)
-    , ui(new Ui::ResultsSummaryPage)
+    , ui(std::make_unique<Ui::ResultsSummaryPage>())
 {
     ui->setupUi(this);
 
     ui->parserErrorsBox->setVisible(false);
 
     auto bottomUpCostModel = new BottomUpModel(this);
+    auto perLibraryModel = new PerLibraryModel(this);
 
     auto topHotspotsProxy = new TopProxy(this);
     topHotspotsProxy->setSourceModel(bottomUpCostModel);
@@ -61,8 +41,19 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
     ui->topHotspotsTableView->setSortingEnabled(false);
     ui->topHotspotsTableView->setModel(topHotspotsProxy);
     ResultsUtil::setupCostDelegate<BottomUpModel>(bottomUpCostModel, ui->topHotspotsTableView);
-    ResultsUtil::setupHeaderView(ui->topHotspotsTableView);
-    ResultsUtil::setupContextMenu(ui->topHotspotsTableView, bottomUpCostModel, filterStack, this);
+    ResultsUtil::setupHeaderView(ui->topHotspotsTableView, contextMenu);
+    ResultsUtil::setupContextMenu(ui->topHotspotsTableView, contextMenu, bottomUpCostModel, filterStack, this);
+
+    auto topLibraryProxy = new TopProxy(this);
+    topLibraryProxy->setSourceModel(perLibraryModel);
+    topLibraryProxy->setCostColumn(PerLibraryModel::InitialSortColumn);
+    topLibraryProxy->setNumBaseColumns(PerLibraryModel::NUM_BASE_COLUMNS);
+
+    ui->topLibraryTreeView->setSortingEnabled(false);
+    ui->topLibraryTreeView->setModel(topLibraryProxy);
+    ResultsUtil::setupCostDelegate<PerLibraryModel>(perLibraryModel, ui->topLibraryTreeView);
+    ResultsUtil::setupHeaderView(ui->topLibraryTreeView, contextMenu);
+    ResultsUtil::setupContextMenu(ui->topLibraryTreeView, contextMenu, perLibraryModel, filterStack, this, {});
 
     connect(ui->eventSourceComboBox, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
             [topHotspotsProxy, this]() {
@@ -70,12 +61,30 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
                                                 + BottomUpModel::NUM_BASE_COLUMNS);
             });
 
-    connect(parser, &PerfParser::bottomUpDataAvailable, this,
-            [this, bottomUpCostModel](const Data::BottomUpResults& data) {
-                bottomUpCostModel->setData(data);
-                ResultsUtil::hideEmptyColumns(data.costs, ui->topHotspotsTableView, BottomUpModel::NUM_BASE_COLUMNS);
-                ResultsUtil::fillEventSourceComboBox(ui->eventSourceComboBox, data.costs,
-                                                     ki18n("Show top hotspots for %1 events."));
+    connect(ui->eventSourceComboBox_2, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [topLibraryProxy, this]() {
+                topLibraryProxy->setCostColumn(ui->eventSourceComboBox_2->currentData().toInt()
+                                               + PerLibraryModel::NUM_BASE_COLUMNS);
+            });
+
+    connect(
+        parser, &PerfParser::bottomUpDataAvailable, this, [this, bottomUpCostModel](const Data::BottomUpResults& data) {
+            bottomUpCostModel->setData(data);
+            ResultsUtil::hideEmptyColumns(data.costs, ui->topHotspotsTableView, BottomUpModel::NUM_BASE_COLUMNS);
+            ResultsUtil::hideTracepointColumns(data.costs, ui->topHotspotsTableView, BottomUpModel::NUM_BASE_COLUMNS);
+            ResultsUtil::fillEventSourceComboBox(ui->eventSourceComboBox, data.costs,
+                                                 tr("Show top hotspots for %1 events."));
+        });
+
+    connect(parser, &PerfParser::perLibraryDataAvailable, this,
+            [this, perLibraryModel](const Data::PerLibraryResults& data) {
+                perLibraryModel->setData(data);
+                ResultsUtil::hideEmptyColumns(data.costs, ui->topLibraryTreeView, PerLibraryModel::NUM_BASE_COLUMNS);
+                ResultsUtil::hideTracepointColumns(data.costs, ui->topLibraryTreeView,
+                                                   PerLibraryModel::NUM_BASE_COLUMNS);
+
+                ResultsUtil::fillEventSourceComboBox(ui->eventSourceComboBox_2, data.costs,
+                                                     tr("Show top hotspots for %1 events."));
             });
 
     auto parserErrorsModel = new QStringListModel(this);
@@ -94,7 +103,7 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
             stream << "<qt><table>"
                    << formatSummaryText(tr("Command"),
                                         QLatin1String("<tt>") + data.command.toHtmlEscaped() + QLatin1String("</tt>"))
-                   << formatSummaryText(tr("Run Time"), Util::formatTimeString(data.applicationRunningTime));
+                   << formatSummaryText(tr("Run Time"), Util::formatTimeString(data.applicationTime.delta()));
             if (data.offCpuTime > 0 || data.onCpuTime > 0) {
                 stream << formatSummaryText(indent + tr("On CPU Time"), Util::formatTimeString(data.onCpuTime))
                        << formatSummaryText(indent + tr("Off CPU Time"), Util::formatTimeString(data.offCpuTime));
@@ -102,16 +111,16 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
             stream << formatSummaryText(tr("Processes"), QString::number(data.processCount))
                    << formatSummaryText(tr("Threads"), QString::number(data.threadCount));
             if (data.offCpuTime > 0 || data.onCpuTime > 0) {
-                stream << formatSummaryText(indent + tr("Avg. Running"),
-                                            Util::formatCostRelative(data.onCpuTime, data.applicationRunningTime * 100))
-                       << formatSummaryText(
-                              indent + tr("Avg. Sleeping"),
-                              Util::formatCostRelative(data.offCpuTime, data.applicationRunningTime * 100));
+                stream
+                    << formatSummaryText(indent + tr("Avg. Running"),
+                                         Util::formatCostRelative(data.onCpuTime, data.applicationTime.delta() * 100))
+                    << formatSummaryText(indent + tr("Avg. Sleeping"),
+                                         Util::formatCostRelative(data.offCpuTime, data.applicationTime.delta() * 100));
             }
             stream << formatSummaryText(
                 tr("Total Samples"),
                 tr("%1 (%4)").arg(QString::number(data.sampleCount),
-                                  Util::formatFrequency(data.sampleCount, data.applicationRunningTime)));
+                                  Util::formatFrequency(data.sampleCount, data.applicationTime.delta())));
             for (const auto& costSummary : data.costs) {
                 if (!costSummary.sampleCount) {
                     continue;
@@ -125,8 +134,8 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
                     tr("%1 (%2 samples, %3% of total, %4)")
                         .arg(Util::formatCost(costSummary.totalPeriod), Util::formatCost(costSummary.sampleCount),
                              Util::formatCostRelative(costSummary.sampleCount, data.sampleCount),
-                             Util::formatFrequency(costSummary.sampleCount, data.applicationRunningTime)));
-                if ((costSummary.sampleCount * 1E9 / data.applicationRunningTime) < 100) {
+                             Util::formatFrequency(costSummary.sampleCount, data.applicationTime.delta())));
+                if ((costSummary.sampleCount * 1E9 / data.applicationTime.delta()) < 100) {
                     stream << formatSummaryText(indent + tr("<b>WARNING</b>"), tr("Sampling frequency below 100Hz"));
                 }
             }
@@ -138,7 +147,7 @@ ResultsSummaryPage::ResultsSummaryPage(FilterAndZoomStack* filterStack, PerfPars
 
         QString systemInfoText;
         if (!data.hostName.isEmpty()) {
-            KFormat format;
+            const auto format = KFormat();
             QTextStream stream(&systemInfoText);
             stream << "<qt><table>" << formatSummaryText(tr("Host Name"), data.hostName)
                    << formatSummaryText(tr("Linux Kernel Version"), data.linuxKernelVersion)

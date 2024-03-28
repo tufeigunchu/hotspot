@@ -1,3 +1,4 @@
-set(CMAKE_BUILD_TYPE RelWithDebInfo)
-
-add_executable(c-syscalls main.c)
+add_executable(
+    c-syscalls
+    main.c
+)

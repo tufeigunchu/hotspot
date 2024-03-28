@@ -1,47 +1,31 @@
 /*
-  tst_models.cpp
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2017-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Milian Wolff <milian.wolff@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
+#include <QAbstractItemModelTester>
 #include <QDebug>
+#include <QFontDatabase>
 #include <QObject>
+#include <QProcess>
+#include <QRegularExpression>
 #include <QTest>
 #include <QTextStream>
-#include <QAbstractItemModelTester>
 
 #include "../testutils.h"
 
-#include <models/eventmodel.h>
 #include <models/disassemblymodel.h>
+#include <models/eventmodel.h>
+#include <models/sourcecodemodel.h>
 
 namespace {
 Data::BottomUpResults buildBottomUpTree(const QByteArray& stacks)
 {
     Data::BottomUpResults ret;
-    ret.costs.addType(0, "samples", Data::Costs::Unit::Unknown);
-    ret.root.symbol = {"<root>", {}};
+    ret.costs.addType(0, QStringLiteral("samples"), Data::Costs::Unit::Unknown);
+    ret.root.symbol = {QStringLiteral("<root>"), {}};
     const auto& lines = stacks.split('\n');
     QHash<quint32, Data::Symbol> ids;
     quint32 maxId = 0;
@@ -54,9 +38,9 @@ Data::BottomUpResults buildBottomUpTree(const QByteArray& stacks)
         auto* parent = &ret.root;
         for (auto it = frames.rbegin(), end = frames.rend(); it != end; ++it) {
             const auto& frame = *it;
-            const auto symbol = Data::Symbol {frame, {}};
+            const auto symbol = Data::Symbol {QString::fromUtf8(frame), {}};
             auto node = parent->entryForSymbol(symbol, &maxId);
-            Q_ASSERT(!ids.contains(node->id) || ids[node->id] == symbol);
+            VERIFY_OR_THROW(!ids.contains(node->id) || ids[node->id] == symbol);
             ids[node->id] = symbol;
             ret.costs.increment(0, node->id);
             parent = node;
@@ -81,11 +65,29 @@ Data::BottomUpResults generateTree1()
         C
     )");
 }
+
+Data::BottomUpResults generateTreeByThread()
+{
+    return buildBottomUpTree(R"(
+        A;B;C;T1
+        A;B;D;T1
+        A;B;D;T2
+        A;B;C;E;T1
+        A;B;C;E;C;T1
+        A;B;C;E;C;E;T1
+        A;B;C;C;T1
+        C;T1
+        C;T2
+    )");
+}
 }
 
 class TestModels : public QObject
 {
     Q_OBJECT
+public:
+    using QObject::QObject;
+
 private slots:
     void testTreeParents()
     {
@@ -107,11 +109,12 @@ private slots:
         QCOMPARE(tree.costs.totalCost(0), qint64(9));
 
         const auto expectedTree = QStringList {
-            // clang-format: off
-            "C=5",  " B=1",  "  A=1", " E=1", "  C=1", "   B=1", "    A=1", " C=1",   "  B=1",   "   A=1",  "D=2",
-            " B=2", "  A=2", "E=2",   " C=2", "  B=1", "   A=1", "  E=1",   "   C=1", "    B=1", "     A=1"
-            //clang-format on
-        };
+            QStringLiteral("C=5"),     QStringLiteral(" B=1"),   QStringLiteral("  A=1"),   QStringLiteral(" E=1"),
+            QStringLiteral("  C=1"),   QStringLiteral("   B=1"), QStringLiteral("    A=1"), QStringLiteral(" C=1"),
+            QStringLiteral("  B=1"),   QStringLiteral("   A=1"), QStringLiteral("D=2"),     QStringLiteral(" B=2"),
+            QStringLiteral("  A=2"),   QStringLiteral("E=2"),    QStringLiteral(" C=2"),    QStringLiteral("  B=1"),
+            QStringLiteral("   A=1"),  QStringLiteral("  E=1"),  QStringLiteral("   C=1"),  QStringLiteral("    B=1"),
+            QStringLiteral("     A=1")};
         QCOMPARE(printTree(tree), expectedTree);
 
         BottomUpModel model;
@@ -158,7 +161,7 @@ private slots:
         const auto i1_idx = model.indexFromItem(i1, 0);
         QVERIFY(i1_idx.isValid());
         QCOMPARE(i1_idx, model.index(0, 0));
-        QCOMPARE(model.parent(i1_idx), {});
+        QCOMPARE(model.parent(i1_idx), QModelIndex());
         QCOMPARE(model.itemFromIndex(i1_idx), i1);
         QCOMPARE(model.rowCount(i1_idx), 2); // simplified
 
@@ -197,25 +200,53 @@ private slots:
 
         const auto expectedModelData = QStringList {
             // clang-format: off
-            "1", " 2", " ↪3", "  4", "  5", "6", " 7", "  8", "   9", "  10", "   11", "  12", " 13", "14",
+            QStringLiteral("1"),    QStringLiteral(" 2"),   QStringLiteral(" ↪3"),   QStringLiteral("  4"),
+            QStringLiteral("  5"),  QStringLiteral("6"),    QStringLiteral(" 7"),    QStringLiteral("  8"),
+            QStringLiteral("   9"), QStringLiteral("  10"), QStringLiteral("   11"), QStringLiteral("  12"),
+            QStringLiteral(" 13"),  QStringLiteral("14"),
             // clang-format: on
         };
         QCOMPARE(modelData, expectedModelData);
     }
 
+    void testTopDownModel_data()
+    {
+        QTest::addColumn<bool>("skipFirstLevel");
+        QTest::addColumn<QStringList>("expectedTree");
+
+        QTest::addRow("normal") << false
+                                << QStringList {QStringLiteral("A=s:0,i:7"),     QStringLiteral(" B=s:0,i:7"),
+                                                QStringLiteral("  C=s:1,i:5"),   QStringLiteral("   E=s:1,i:3"),
+                                                QStringLiteral("    C=s:1,i:2"), QStringLiteral("     E=s:1,i:1"),
+                                                QStringLiteral("   C=s:1,i:1"),  QStringLiteral("  D=s:2,i:2"),
+                                                QStringLiteral("C=s:2,i:2")};
+
+        QTest::addRow("skipFirstLevel") << true
+                                        << QStringList {
+                                               QStringLiteral("T1=s:0,i:7"),      QStringLiteral(" A=s:0,i:6"),
+                                               QStringLiteral("  B=s:0,i:6"),     QStringLiteral("   C=s:1,i:5"),
+                                               QStringLiteral("    E=s:1,i:3"),   QStringLiteral("     C=s:1,i:2"),
+                                               QStringLiteral("      E=s:1,i:1"), QStringLiteral("    C=s:1,i:1"),
+                                               QStringLiteral("   D=s:1,i:1"),    QStringLiteral(" C=s:1,i:1"),
+                                               QStringLiteral("T2=s:0,i:2"),      QStringLiteral(" A=s:0,i:1"),
+                                               QStringLiteral("  B=s:0,i:1"),     QStringLiteral("   D=s:1,i:1"),
+                                               QStringLiteral(" C=s:1,i:1"),
+                                           };
+    }
+
     void testTopDownModel()
     {
-        const auto bottomUpTree = generateTree1();
-        const auto tree = Data::TopDownResults::fromBottomUp(bottomUpTree);
+        QFETCH(bool, skipFirstLevel);
+        QFETCH(QStringList, expectedTree);
+
+        const auto bottomUpTree = skipFirstLevel ? generateTreeByThread() : generateTree1();
+        const auto tree = Data::TopDownResults::fromBottomUp(bottomUpTree, skipFirstLevel);
         QCOMPARE(tree.inclusiveCosts.totalCost(0), qint64(9));
         QCOMPARE(tree.selfCosts.totalCost(0), qint64(9));
 
-        const QStringList expectedTree = {"A=s:0,i:7",    " B=s:0,i:7",    "  C=s:1,i:5",
-                                          "   E=s:1,i:3", "    C=s:1,i:2", "     E=s:1,i:1",
-                                          "   C=s:1,i:1", "  D=s:2,i:2",   "C=s:2,i:2"};
         QTextStream(stdout) << "Actual:\n"
-                            << printTree(tree).join("\n") << "\nExpected:\n"
-                            << expectedTree.join("\n") << "\n";
+                            << printTree(tree).join(QLatin1Char('\n')) << "\nExpected:\n"
+                            << expectedTree.join(QLatin1Char('\n')) << "\n";
         QCOMPARE(printTree(tree), expectedTree);
 
         TopDownModel model;
@@ -251,21 +282,24 @@ private slots:
         Data::CallerCalleeResults results;
         Data::callerCalleesFromBottomUpData(tree, &results);
         const QStringList expectedMap = {
-            "A=s:0,i:7", "A>B=7", "B=s:0,i:7", "B<A=7",     "B>C=5", "B>D=2",     "C=s:5,i:7", "C<B=5", "C<C=1",
-            "C<E=2",     "C>C=1", "C>E=3",     "D=s:2,i:2", "D<B=2", "E=s:2,i:3", "E<C=3",     "E>C=2",
+            QStringLiteral("A=s:0,i:7"), QStringLiteral("A>B=7"), QStringLiteral("B=s:0,i:7"), QStringLiteral("B<A=7"),
+            QStringLiteral("B>C=5"),     QStringLiteral("B>D=2"), QStringLiteral("C=s:5,i:7"), QStringLiteral("C<B=5"),
+            QStringLiteral("C<C=1"),     QStringLiteral("C<E=2"), QStringLiteral("C>C=1"),     QStringLiteral("C>E=3"),
+            QStringLiteral("D=s:2,i:2"), QStringLiteral("D<B=2"), QStringLiteral("E=s:2,i:3"), QStringLiteral("E<C=3"),
+            QStringLiteral("E>C=2"),
         };
         QTextStream(stdout) << "Actual:\n"
-                            << printMap(results).join("\n") << "\n\nExpected:\n"
-                            << expectedMap.join("\n") << "\n";
+                            << printMap(results).join(QLatin1Char('\n')) << "\n\nExpected:\n"
+                            << expectedMap.join(QLatin1Char('\n')) << "\n";
         QCOMPARE(printMap(results), expectedMap);
 
         CallerCalleeModel model;
         QAbstractItemModelTester tester(&model);
         model.setResults(results);
-        QTextStream(stdout) << "\nActual Model:\n" << printCallerCalleeModel(model).join("\n") << "\n";
+        QTextStream(stdout) << "\nActual Model:\n" << printCallerCalleeModel(model).join(QLatin1Char('\n')) << "\n";
         QCOMPARE(printCallerCalleeModel(model), expectedMap);
 
-        for (const auto& entry : results.entries) {
+        for (const auto& entry : std::as_const(results.entries)) {
             {
                 CallerModel model;
                 QAbstractItemModelTester tester(&model);
@@ -287,12 +321,14 @@ private slots:
     void testDisassemblyModel_data()
     {
         QTest::addColumn<Data::Symbol>("symbol");
-        Data::Symbol symbol = {"__cos_fma",
+        Data::Symbol symbol = {QStringLiteral("__cos_fma"),
                                4294544,
                                2093,
-                               "vector_static_gcc/vector_static_gcc_v9.1.0",
-                               "/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/perfdata/vector_static_gcc/vector_static_gcc_v9.1.0",
-                               "/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/perfdata/vector_static_gcc/vector_static_gcc_v9.1.0"};
+                               QStringLiteral("vector_static_gcc/vector_static_gcc_v9.1.0"),
+                               QStringLiteral("/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/"
+                                              "perfdata/vector_static_gcc/vector_static_gcc_v9.1.0"),
+                               QStringLiteral("/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/"
+                                              "perfdata/vector_static_gcc/vector_static_gcc_v9.1.0")};
 
         QTest::newRow("curSymbol") << symbol;
     }
@@ -314,15 +350,127 @@ private slots:
         locationCost.inclusiveCost[0] += 200;
         locationCost.selfCost[0] += 200;
 
-        DisassemblyModel model;
-        QAbstractItemModelTester tester(&model);
-        model.setResults(results);
-        QCOMPARE(model.columnCount(), 1 + results.selfCosts.numTypes());
-        QCOMPARE(model.rowCount(), 0); // no disassembly data yet
+        DisassemblyModel model(nullptr);
 
-        DisassemblyOutput disassemblyOutput = DisassemblyOutput::disassemble("objdump","x86_64", symbol);
-        model.setDisassembly(disassemblyOutput);
+        // no disassembly data yet
+        QCOMPARE(model.columnCount(), DisassemblyModel::COLUMN_COUNT);
+        QCOMPARE(model.rowCount(), 0);
+
+        DisassemblyOutput disassemblyOutput =
+            DisassemblyOutput::disassemble(QStringLiteral("objdump"), QStringLiteral("x86_64"), {}, {}, {}, {}, symbol);
+        model.setDisassembly(disassemblyOutput, results);
+        QCOMPARE(model.columnCount(), DisassemblyModel::COLUMN_COUNT + results.selfCosts.numTypes());
         QCOMPARE(model.rowCount(), disassemblyOutput.disassemblyLines.size());
+    }
+
+    void testSourceCodeModelNoFileName_data()
+    {
+        QTest::addColumn<Data::Symbol>("symbol");
+        Data::Symbol symbol = {QStringLiteral("__cos_fma"),
+                               4294544,
+                               2093,
+                               QStringLiteral("vector_static_gcc/vector_static_gcc_v9.1.0"),
+                               QStringLiteral("/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/"
+                                              "perfdata/vector_static_gcc/vector_static_gcc_v9.1.0"),
+                               QStringLiteral("/home/milian/projects/kdab/rnd/hotspot/3rdparty/perfparser/tests/auto/"
+                                              "perfdata/vector_static_gcc/vector_static_gcc_v9.1.0")};
+
+        QTest::newRow("curSymbol") << symbol;
+    }
+
+    void testSourceCodeModelNoFileName()
+    {
+        QFETCH(Data::Symbol, symbol);
+
+        const auto actualBinaryFile = QFINDTESTDATA(symbol.binary);
+        symbol.actualPath = actualBinaryFile;
+
+        const auto tree = generateTree1();
+
+        Data::CallerCalleeResults results;
+        Data::callerCalleesFromBottomUpData(tree, &results);
+
+        SourceCodeModel model(nullptr);
+        QCOMPARE(model.columnCount(), SourceCodeModel::COLUMN_COUNT);
+        QCOMPARE(model.rowCount(), 0);
+
+        DisassemblyOutput disassemblyOutput =
+            DisassemblyOutput::disassemble(QStringLiteral("objdump"), QStringLiteral("x86_64"), {}, {}, {}, {}, symbol);
+        model.setDisassembly(disassemblyOutput, results);
+
+        // no source file name
+        QCOMPARE(model.columnCount(), SourceCodeModel::COLUMN_COUNT);
+        QCOMPARE(model.rowCount(), 0);
+    }
+
+    void testSourceCodeModelSourceCodeLineAssociation()
+    {
+        const QString binary =
+            QFINDTESTDATA(".") + QStringLiteral("/../tests/test-clients/cpp-recursion/cpp-recursion");
+
+        // use readelf to get address and size of main
+        // different compilers create different locations and sizes
+        QRegularExpression regex(QStringLiteral("[ ]+[0-9]+: ([0-9a-f]+)[ ]+([0-9]+)[0-9 a-zA-Z]+main\\n"));
+
+        QProcess readelf;
+        readelf.setProgram(QStringLiteral("readelf"));
+        readelf.setArguments({QStringLiteral("-s"), binary});
+
+        readelf.start();
+        readelf.waitForFinished();
+
+        const auto output = readelf.readAllStandardOutput();
+        QVERIFY(!output.isEmpty());
+
+        auto match = regex.match(QString::fromUtf8(output));
+
+        QVERIFY(match.hasMatch());
+
+        bool ok = false;
+        const quint64 address = match.captured(1).toInt(&ok, 16);
+        QVERIFY(ok);
+        const quint64 size = match.captured(2).toInt(&ok, 10);
+        QVERIFY(ok);
+
+        Data::Symbol symbol = {QStringLiteral("main"), address, size, QStringLiteral("cpp-recursion"), {}, binary};
+
+        SourceCodeModel model(nullptr);
+        QCOMPARE(model.columnCount(), SourceCodeModel::COLUMN_COUNT);
+        QCOMPARE(model.rowCount(), 0);
+
+        auto disassemblyOutput =
+            DisassemblyOutput::disassemble(QStringLiteral("objdump"), QStringLiteral("x86_64"), {}, {}, {}, {}, symbol);
+        QVERIFY(disassemblyOutput.errorMessage.isEmpty());
+        model.setDisassembly(disassemblyOutput, {});
+
+        QCOMPARE(model.columnCount(), SourceCodeModel::COLUMN_COUNT);
+        QCOMPARE(model.rowCount(), 11);
+
+        // check source code boundary
+        QCOMPARE(model.index(1, SourceCodeModel::SourceCodeLineNumber)
+                     .data(SourceCodeModel::FileLineRole)
+                     .value<Data::FileLine>()
+                     .line,
+                 19);
+        QCOMPARE(model.index(7, SourceCodeModel::SourceCodeLineNumber)
+                     .data(SourceCodeModel::FileLineRole)
+                     .value<Data::FileLine>()
+                     .line,
+                 25);
+        QCOMPARE(model.index(10, SourceCodeModel::SourceCodeLineNumber)
+                     .data(SourceCodeModel::FileLineRole)
+                     .value<Data::FileLine>()
+                     .line,
+                 28);
+
+        // check associated lines
+        QCOMPARE(model.index(1, SourceCodeModel::SourceCodeColumn).data(SourceCodeModel::RainbowLineNumberRole).toInt(),
+                 19);
+        QCOMPARE(model.index(7, SourceCodeModel::SourceCodeColumn).data(SourceCodeModel::RainbowLineNumberRole).toInt(),
+                 25);
+        QCOMPARE(
+            model.index(10, SourceCodeModel::SourceCodeColumn).data(SourceCodeModel::RainbowLineNumberRole).toInt(),
+            28);
     }
 
     void testEventModel()
@@ -343,31 +491,31 @@ private slots:
             thread1.pid = 1234;
             thread1.tid = 1234;
             thread1.time = {0, endTime};
-            thread1.name = "foobar";
+            thread1.name = QStringLiteral("foobar");
         }
         auto& thread2 = events.threads[1];
         {
             thread2.pid = 1234;
             thread2.tid = 1235;
             thread2.time = {deltaTime, endTime - deltaTime};
-            thread2.name = "asdf";
+            thread2.name = QStringLiteral("asdf");
         }
         auto& thread3 = events.threads[2];
         {
             thread3.pid = 5678;
             thread3.tid = 5678;
             thread3.time = {0, endTime};
-            thread3.name = "barfoo";
+            thread3.name = QStringLiteral("barfoo");
         }
         auto& thread4 = events.threads[3];
         {
             thread4.pid = 5678;
             thread4.tid = 5679;
             thread4.time = {endTime - deltaTime, endTime};
-            thread4.name = "blub";
+            thread4.name = QStringLiteral("blub");
         }
 
-        Data::CostSummary costSummary("cycles", 0, 0, Data::Costs::Unit::Unknown);
+        Data::CostSummary costSummary(QStringLiteral("cycles"), 0, 0, Data::Costs::Unit::Unknown);
         auto generateEvent = [&costSummary, &events](quint64 time, quint32 cpuId) -> Data::Event {
             Data::Event event;
             event.cost = 10;
@@ -429,7 +577,7 @@ private slots:
                 // let's only look at the first process
                 parent = model.index(0, EventModel::ThreadColumn, parent);
                 verifyCommonData(parent);
-                QCOMPARE(parent.data().toString(), "foobar (#1234)");
+                QCOMPARE(parent.data().toString(), QLatin1String("foobar (#1234)"));
                 numRows = model.rowCount(parent);
                 QCOMPARE(numRows, 2);
             }
@@ -629,8 +777,95 @@ private slots:
 
         QCOMPARE(Data::Symbol(symbol).prettySymbol, prettySymbol);
     }
+
+    void testCollapseTemplates_data()
+    {
+        QTest::addColumn<QString>("original");
+        QTest::addColumn<QString>("collapsed");
+
+        QTest::addRow("operator<") << "Foo<Bar> operator< (Asdf<Xyz>);"
+                                   << "Foo<…> operator< (Asdf<…>);";
+        QTest::addRow("operator>") << "Foo<Bar> operator> (Asdf<Xyz>);"
+                                   << "Foo<…> operator> (Asdf<…>);";
+        QTest::addRow("operator<<") << "Foo<Bar> operator<< (Asdf<Xyz>);"
+                                    << "Foo<…> operator<< (Asdf<…>);";
+        QTest::addRow("operator>>") << "Foo<Bar> operator>> (Asdf<Xyz>);"
+                                    << "Foo<…> operator>> (Asdf<…>);";
+
+        QTest::addRow("operator <") << "Foo<Bar> operator < (Asdf<Xyz>);"
+                                    << "Foo<…> operator < (Asdf<…>);";
+        QTest::addRow("operator   >") << "Foo<Bar> operator   > (Asdf<Xyz>);"
+                                      << "Foo<…> operator   > (Asdf<…>);";
+        QTest::addRow("operator <<") << "Foo<Bar> operator << (Asdf<Xyz>);"
+                                     << "Foo<…> operator << (Asdf<…>);";
+        QTest::addRow("operator   >>") << "Foo<Bar> operator   >> (Asdf<Xyz>);"
+                                       << "Foo<…> operator   >> (Asdf<…>);";
+
+        QTest::addRow("operator< 2") << "Foo<Bar<Xyz>> operator< (Asdf<Xyz>);"
+                                     << "Foo<…> operator< (Asdf<…>);";
+        QTest::addRow("operator> 2") << "Foo<Bar<Xyz>> operator> (Asdf<Xyz>);"
+                                     << "Foo<…> operator> (Asdf<…>);";
+        QTest::addRow("operator<< 2") << "Foo<Bar<Xyz>> operator<< (Asdf<Xyz>);"
+                                      << "Foo<…> operator<< (Asdf<…>);";
+        QTest::addRow("operator>> 2") << "Foo<Bar<Xyz>> operator>> (Asdf<Xyz>);"
+                                      << "Foo<…> operator>> (Asdf<…>);";
+    }
+
+    void testCollapseTemplates()
+    {
+        QFETCH(QString, original);
+        QFETCH(QString, collapsed);
+
+        QCOMPARE(Util::collapseTemplate(original, 1), collapsed);
+    }
+
+    void testSymbolEliding_data()
+    {
+        QTest::addColumn<int>("maxWidth");
+        QTest::addColumn<QString>("elidedSymbol");
+
+        const auto w = monospaceMetrics().averageCharWidth();
+        QTest::addRow("no eliding") << w
+                * 108 << "asdf_namespace::foobar<asdf, yxcvyxcv>::blablub(someotherreallylongnames) const";
+        QTest::addRow("elide arguments") << w
+                * 77 << "asdf_namespace::foobar<asdf, yxcvyxcv>::blablub(someotherreallylongn…) const";
+        QTest::addRow("elide templates") << w * 54 << "asdf_namespace::foobar<…>::blablub(…) const";
+        QTest::addRow("elide symbol") << w * 27 << "…obar<…>::blablub(…) const";
+    }
+
+    void testSymbolEliding()
+    {
+
+        const QString testSymbol =
+            QStringLiteral("asdf_namespace::foobar<asdf, yxcvyxcv>::blablub(someotherreallylongnames) const");
+
+        QFETCH(int, maxWidth);
+        QFETCH(QString, elidedSymbol);
+
+        QCOMPARE(Util::elideSymbol(testSymbol, monospaceMetrics(), maxWidth), elidedSymbol);
+    }
+
+    void testSymbolElidingParanthese()
+    {
+        auto font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        font.setPixelSize(10);
+
+        const QString symbol = QStringLiteral("Foo<&bar::operator()>::asdf<XYZ>(blabla<&foo::operator(), ')', '('>)");
+
+        const auto metrics = monospaceMetrics();
+        QCOMPARE(Util::elideSymbol(symbol, metrics, metrics.averageCharWidth() * 54),
+                 QStringLiteral("Foo<&bar::operator()>::asdf<XYZ>(blabla<&foo::opera…)"));
+    }
+
+private:
+    static QFontMetrics monospaceMetrics()
+    {
+        auto font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        font.setPixelSize(10);
+        return QFontMetrics(font);
+    }
 };
 
-QTEST_GUILESS_MAIN(TestModels);
+HOTSPOT_GUITEST_MAIN(TestModels)
 
 #include "tst_models.moc"

@@ -1,39 +1,20 @@
 /*
-  mainwindow.cpp
+    SPDX-FileCopyrightText: Nate Rogers <nate.rogers@kdab.com>
+    SPDX-FileCopyrightText: Milian Wolff <milian.wolff@kdab.com>
+    SPDX-FileCopyrightText: 2016 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
 
-  This file is part of Hotspot, the Qt GUI for performance analysis.
-
-  Copyright (C) 2016-2020 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
-  Author: Nate Rogers <nate.rogers@kdab.com>
-
-  Licensees holding valid commercial KDAB Hotspot licenses may use this file in
-  accordance with Hotspot Commercial License Agreement provided with the Software.
-
-  Contact info@kdab.com if any conditions of this licensing are not clear to you.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    SPDX-License-Identifier: GPL-2.0-or-later
 */
 
 #include "mainwindow.h"
 #include "recordpage.h"
 #include "resultspage.h"
 #include "settings.h"
+#include "settingsdialog.h"
 #include "startpage.h"
 #include "ui_mainwindow.h"
-#include "settingsdialog.h"
-#include "ui_settingsdialog.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QFileDialog>
 #include <QStackedWidget>
@@ -48,11 +29,17 @@
 #include <QStandardPaths>
 #include <QWidgetAction>
 
+#include <KColorScheme>
 #include <KConfigGroup>
 #include <KNotification>
 #include <KRecentFilesAction>
 #include <KShell>
 #include <KStandardAction>
+
+#include <kio_version.h>
+#if KIO_VERSION >= QT_VERSION_CHECK(5, 69, 0)
+#include <KIO/CommandLauncherJob>
+#endif
 
 #include <kddockwidgets/LayoutSaver.h>
 
@@ -68,26 +55,21 @@ struct IdeSettings
     const char* const app;
     const char* const args;
     const char* const name;
+    const char* const desktopEntryName;
 };
 
-static const IdeSettings ideSettings[] = {
-#if defined(Q_OS_WIN) || defined(Q_OS_OSX)
-    {"", "", "", ""} // Dummy content, because we can't have empty arrays.
-#else
-    {"kdevelop", "%f:%l:%c", QT_TRANSLATE_NOOP("MainWindow", "KDevelop")},
-    {"kate", "%f --line %l --column %c", QT_TRANSLATE_NOOP("MainWindow", "Kate")},
-    {"kwrite", "%f --line %l --column %c", QT_TRANSLATE_NOOP("MainWindow", "KWrite")},
-    {"gedit", "%f +%l:%c", QT_TRANSLATE_NOOP("MainWindow", "gedit")},
-    {"gvim", "%f +%l", QT_TRANSLATE_NOOP("MainWindow", "gvim")},
-    {"qtcreator", "-client %f:%l", QT_TRANSLATE_NOOP("MainWindow", "Qt Creator")}
+const IdeSettings ideSettings[] = {
+#if !defined(Q_OS_WIN) && !defined(Q_OS_OSX)
+    {"kdevelop", "%f:%l:%c", QT_TRANSLATE_NOOP("MainWindow", "KDevelop"), "org.kde.kdevelop"},
+    {"kate", "%f --line %l --column %c", QT_TRANSLATE_NOOP("MainWindow", "Kate"), "org.kde.kate"},
+    {"kwrite", "%f --line %l --column %c", QT_TRANSLATE_NOOP("MainWindow", "KWrite"), "org.kde.kwrite"},
+    {"gedit", "%f +%l:%c", QT_TRANSLATE_NOOP("MainWindow", "gedit"), "org.gnome.gedit"},
+    {"gvim", "%f +%l", QT_TRANSLATE_NOOP("MainWindow", "gvim"), "gvim"},
+    {"qtcreator", "-client %f:%l", QT_TRANSLATE_NOOP("MainWindow", "Qt Creator"), "org.qt-project.qtcreator"},
 #endif
-};
-#if defined(Q_OS_WIN)                                                                                                  \
-    || defined(Q_OS_OSX) // Remove this #if branch when adding real data to ideSettings for Windows/OSX.
-static const int ideSettingsSize = 0;
-#else
-static const int ideSettingsSize = sizeof(ideSettings) / sizeof(IdeSettings);
-#endif
+    {"code", "-g %f:%l:%c", QT_TRANSLATE_NOOP("MainWindow", "Visual Studio Code"), "code"},
+    {"codium", "-g %f:%l:%c", QT_TRANSLATE_NOOP("MainWindow", "VSCodium"), "codium"}};
+const int ideSettingsSize = sizeof(ideSettings) / sizeof(IdeSettings);
 
 bool isAppAvailable(const char* app)
 {
@@ -107,7 +89,7 @@ int firstAvailableIde()
 
 MainWindow::MainWindow(QWidget* parent)
     : KParts::MainWindow(parent)
-    , ui(new Ui::MainWindow)
+    , ui(std::make_unique<Ui::MainWindow>())
     , m_parser(new PerfParser(this))
     , m_config(KSharedConfig::openConfig())
     , m_pageStack(new QStackedWidget(this))
@@ -122,24 +104,27 @@ MainWindow::MainWindow(QWidget* parent)
     m_pageStack->addWidget(m_resultsPage);
     m_pageStack->addWidget(m_recordPage);
 
-    QVBoxLayout* layout = new QVBoxLayout;
+    auto* layout = new QVBoxLayout;
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(m_pageStack);
     centralWidget()->setLayout(layout);
 
-    connect(m_settingsDialog, &QDialog::accepted, this, [this]() {
-        setSysroot(m_settingsDialog->sysroot());
-        setAppPath(m_settingsDialog->appPath());
-        setExtraLibPaths(m_settingsDialog->extraLibPaths());
-        setDebugPaths(m_settingsDialog->debugPaths());
-        setKallsyms(m_settingsDialog->kallsyms());
-        setArch(m_settingsDialog->arch());
-        setObjdump(m_settingsDialog->objdump());
+    auto settings = Settings::instance();
+
+    connect(m_settingsDialog, &QDialog::accepted, this, [this, settings]() {
+        settings->setSysroot(m_settingsDialog->sysroot());
+        settings->setAppPath(m_settingsDialog->appPath());
+        settings->setExtraLibPaths(m_settingsDialog->extraLibPaths());
+        settings->setDebugPaths(m_settingsDialog->debugPaths());
+        settings->setKallsyms(m_settingsDialog->kallsyms());
+        settings->setArch(m_settingsDialog->arch());
+        settings->setObjdump(m_settingsDialog->objdump());
+        settings->setPerfMapPath(m_settingsDialog->perfMapPath());
     });
 
-    connect(this, &MainWindow::sysrootChanged, m_resultsPage, &ResultsPage::setSysroot);
-    connect(this, &MainWindow::appPathChanged, m_resultsPage, &ResultsPage::setAppPath);
-    connect(this, &MainWindow::objdumpChanged, m_resultsPage, &ResultsPage::setObjdump);
+    connect(settings, &Settings::sysrootChanged, m_resultsPage, &ResultsPage::setSysroot);
+    connect(settings, &Settings::appPathChanged, m_resultsPage, &ResultsPage::setAppPath);
+    connect(settings, &Settings::objdumpChanged, m_resultsPage, &ResultsPage::setObjdump);
     connect(m_startPage, &StartPage::pathSettingsButtonClicked, this, &MainWindow::openSettingsDialog);
 
     connect(m_startPage, &StartPage::openFileButtonClicked, this, &MainWindow::onOpenFileButtonClicked);
@@ -147,6 +132,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_startPage, &StartPage::stopParseButtonClicked, this,
             static_cast<void (MainWindow::*)()>(&MainWindow::clear));
     connect(m_parser, &PerfParser::progress, m_startPage, &StartPage::onParseFileProgress);
+    connect(m_parser, &PerfParser::debugInfoDownloadProgress, m_startPage, &StartPage::onDebugInfoDownloadProgress);
     connect(this, &MainWindow::openFileError, m_startPage, &StartPage::onOpenFileError);
     connect(m_recordPage, &RecordPage::homeButtonClicked, this, &MainWindow::onHomeButtonClicked);
     connect(m_recordPage, &RecordPage::openFile, this,
@@ -161,65 +147,57 @@ MainWindow::MainWindow(QWidget* parent)
         m_exportAction->setEnabled(true);
 
         auto* notification = new KNotification(QStringLiteral("fileSaved"));
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
         notification->setWidget(this);
+#else
+        notification->setWindow(window()->windowHandle());
+#endif
         notification->setUrls({url});
         notification->setText(tr("Processed data saved"));
         notification->sendEvent();
+        emit exportFinished(url);
     });
+    connect(m_parser, &PerfParser::exportFailed, this, &MainWindow::exportFailed);
     connect(m_parser, &PerfParser::parsingFailed, this,
             [this](const QString& errorMessage) { emit openFileError(errorMessage); });
 
     auto* recordDataAction = new QAction(this);
     recordDataAction->setText(tr("&Record Data"));
     recordDataAction->setIcon(QIcon::fromTheme(QStringLiteral("media-record")));
-    recordDataAction->setShortcut(Qt::CTRL + Qt::Key_R);
+    recordDataAction->setShortcut(tr("Ctrl+R"));
     ui->fileMenu->addAction(recordDataAction);
     connect(recordDataAction, &QAction::triggered, this, &MainWindow::onRecordButtonClicked);
+    ui->fileMenu->addSeparator();
 
     connect(m_resultsPage, &ResultsPage::navigateToCode, this, &MainWindow::navigateToCode);
-    ui->fileMenu->addAction(KStandardAction::open(this, SLOT(onOpenFileButtonClicked()), this));
-    m_recentFilesAction = KStandardAction::openRecent(this, SLOT(openFile(QUrl)), this);
-    m_recentFilesAction->loadEntries(m_config->group("RecentFiles"));
+    ui->fileMenu->addAction(KStandardAction::open(this, &MainWindow::onOpenFileButtonClicked, this));
+
+    auto openNewWindow = new QAction(QIcon::fromTheme(QStringLiteral("document-open")), tr("Open in new window"), this);
+    openNewWindow->setShortcut(tr("Ctrl+Shift+O"));
+    connect(openNewWindow, &QAction::triggered, this, [this] {
+        const auto fileName = queryOpenDataFile();
+        if (!fileName.isEmpty())
+            openInNewWindow(fileName);
+    });
+    ui->fileMenu->addAction(openNewWindow);
+    m_recentFilesAction = KStandardAction::openRecent(this, qOverload<const QUrl&>(&MainWindow::openFile), this);
+    m_recentFilesAction->loadEntries(m_config->group(QStringLiteral("RecentFiles")));
     ui->fileMenu->addAction(m_recentFilesAction);
-    m_reloadAction = KStandardAction::redisplay(this, SLOT(reload()), this);
+    ui->fileMenu->addSeparator();
+    m_reloadAction = KStandardAction::redisplay(this, &MainWindow::reload, this);
     m_reloadAction->setText(tr("Reload"));
     ui->fileMenu->addAction(m_reloadAction);
-    m_exportAction = KStandardAction::saveAs(this, SLOT(saveAs()), this);
+    ui->fileMenu->addSeparator();
+    m_exportAction = KStandardAction::saveAs(this, qOverload<>(&MainWindow::saveAs), this);
     ui->fileMenu->addAction(m_exportAction);
-    ui->fileMenu->addAction(KStandardAction::close(this, SLOT(clear()), this));
-    ui->fileMenu->addAction(KStandardAction::quit(this, SLOT(close()), this));
+    ui->fileMenu->addSeparator();
+    ui->fileMenu->addAction(KStandardAction::close(this, qOverload<>(&MainWindow::clear), this));
+    ui->fileMenu->addSeparator();
+    ui->fileMenu->addAction(KStandardAction::quit(this, &MainWindow::close, this));
     connect(ui->actionAbout_Qt, &QAction::triggered, qApp, &QApplication::aboutQt);
     connect(ui->actionAbout_KDAB, &QAction::triggered, this, &MainWindow::aboutKDAB);
     connect(ui->settingsAction, &QAction::triggered, this, &MainWindow::openSettingsDialog);
     connect(ui->actionAbout_Hotspot, &QAction::triggered, this, &MainWindow::aboutHotspot);
-
-    {
-        auto config = m_config->group("Settings");
-        auto settings = Settings::instance();
-        settings->setPrettifySymbols(config.readEntry("prettifySymbols", true));
-        settings->setCollapseTemplates(config.readEntry("collapseTemplates", true));
-        settings->setCollapseDepth(config.readEntry("collapseDepth", 1));
-
-        connect(Settings::instance(), &Settings::prettifySymbolsChanged, this, [this](bool prettifySymbols) {
-            m_config->group("Settings").writeEntry("prettifySymbols", prettifySymbols);
-        });
-
-        connect(Settings::instance(), &Settings::collapseTemplatesChanged, this, [this](bool collapseTemplates) {
-            m_config->group("Settings").writeEntry("collapseTemplates", collapseTemplates);
-        });
-
-        connect(Settings::instance(), &Settings::collapseDepthChanged, this,
-                [this](int collapseDepth) { m_config->group("Settings").writeEntry("collapseDepth", collapseDepth); });
-
-        const QStringList userPaths = {QDir::homePath()};
-        const QStringList systemPaths = {QDir::rootPath()};
-        settings->setPaths(m_config->group("PathSettings").readEntry("userPaths", userPaths),
-                           m_config->group("PathSettings").readEntry("systemPaths", systemPaths));
-        connect(Settings::instance(), &Settings::pathsChanged, this, [this, settings] {
-            m_config->group("PathSettings").writeEntry("userPaths", settings->userPaths());
-            m_config->group("PathSettings").writeEntry("systemPaths", settings->systemPaths());
-        });
-    }
 
     auto* prettifySymbolsAction = ui->viewMenu->addAction(tr("Prettify Symbols"));
     prettifySymbolsAction->setCheckable(true);
@@ -259,6 +237,14 @@ MainWindow::MainWindow(QWidget* parent)
     }
 
     ui->viewMenu->addSeparator();
+    auto* restoreDefaultLayout = new QAction(tr("Restore Default Layout"), this);
+    connect(restoreDefaultLayout, &QAction::triggered, [&] {
+        KDDockWidgets::LayoutSaver serializer(KDDockWidgets::RestoreOption_RelativeToMainWindow);
+        serializer.restoreFromFile(QStringLiteral(":/default-dockwidget-layout.json"));
+    });
+    ui->viewMenu->addAction(restoreDefaultLayout);
+    ui->viewMenu->addSeparator();
+
     ui->viewMenu->addActions(m_resultsPage->filterMenu()->actions());
     ui->viewMenu->addSeparator();
     ui->viewMenu->addMenu(m_resultsPage->exportMenu());
@@ -269,7 +255,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     clear();
 
-    auto config = m_config->group("Window");
+    auto config = m_config->group(QStringLiteral("Window"));
     restoreGeometry(config.readEntry("geometry", QByteArray()));
     restoreState(config.readEntry("state", QByteArray()));
     KDDockWidgets::LayoutSaver serializer(KDDockWidgets::RestoreOption_RelativeToMainWindow);
@@ -280,69 +266,37 @@ MainWindow::MainWindow(QWidget* parent)
         serializer.restoreFromFile(QStringLiteral(":/default-dockwidget-layout.json"));
     }
 
-    m_lastUsedSettings = m_config->group("PerfPaths").readEntry("lastUsed");
+    const auto restored = serializer.restoredDockWidgets();
+    m_resultsPage->initDockWidgets(restored);
 }
 
 MainWindow::~MainWindow() = default;
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    auto config = m_config->group("Window");
+    auto config = m_config->group(QStringLiteral("Window"));
     config.writeEntry("geometry", saveGeometry());
     config.writeEntry("state", saveState());
-    KDDockWidgets::LayoutSaver serializer(KDDockWidgets::RestoreOption_RelativeToMainWindow);
+
+    const auto serializer = KDDockWidgets::LayoutSaver(KDDockWidgets::RestoreOption_RelativeToMainWindow);
     config.writeEntry("layout", serializer.serializeLayout());
 
     m_parser->stop();
-    QMainWindow::closeEvent(event);
+    KMainWindow::closeEvent(event);
 }
 
-void MainWindow::setSysroot(const QString& path)
+QString MainWindow::queryOpenDataFile()
 {
-    m_sysroot = path.trimmed();
-    emit sysrootChanged(m_sysroot);
-}
-
-void MainWindow::setKallsyms(const QString& path)
-{
-    m_kallsyms = path;
-    emit kallsymsChanged(m_kallsyms);
-}
-
-void MainWindow::setDebugPaths(const QString& paths)
-{
-    m_debugPaths = paths;
-    emit debugPathsChanged(m_debugPaths);
-}
-
-void MainWindow::setExtraLibPaths(const QString& paths)
-{
-    m_extraLibPaths = paths;
-    emit extraLibPathsChanged(m_extraLibPaths);
-}
-
-void MainWindow::setAppPath(const QString& path)
-{
-    m_appPath = path;
-    emit appPathChanged(m_appPath);
-}
-
-void MainWindow::setArch(const QString& arch)
-{
-    m_arch = arch;
-    emit archChanged(m_arch);
-}
-
-void MainWindow::setObjdump(const QString& objdump)
-{
-    m_objdump = objdump;
-    emit objdumpChanged(m_objdump);
+    const auto filter = tr("Hotspot data Files (perf*.data perf.data.* *.perfparser);;"
+                           "Linux Perf Files (perf*.data perf.data.*);;"
+                           "Perfparser Files (*.perfparser);;"
+                           "All Files (*)");
+    return QFileDialog::getOpenFileName(this, tr("Open File"), QDir::currentPath(), filter);
 }
 
 void MainWindow::onOpenFileButtonClicked()
 {
-    const auto fileName = QFileDialog::getOpenFileName(this, tr("Open File"), QDir::currentPath(),
-                                                       tr("Data Files (perf*.data perf.data.*);;All Files (*)"));
+    const auto fileName = queryOpenDataFile();
     if (fileName.isEmpty()) {
         return;
     }
@@ -388,19 +342,19 @@ void MainWindow::openFile(const QString& path, bool isReload)
 {
     clear(isReload);
 
-    QFileInfo file(path);
+    const auto file = QFileInfo(path);
     setWindowTitle(tr("%1 - Hotspot").arg(file.fileName()));
 
     m_startPage->showParseFileProgress();
     m_pageStack->setCurrentWidget(m_startPage);
 
     // TODO: support input files of different types via plugins
-    m_parser->startParseFile(path, m_sysroot, m_kallsyms, m_debugPaths, m_extraLibPaths, m_appPath, m_arch);
+    m_parser->startParseFile(path);
     m_reloadAction->setData(path);
     m_exportAction->setData(QUrl::fromLocalFile(file.absoluteFilePath() + QLatin1String(".perfparser")));
 
     m_recentFilesAction->addUrl(QUrl::fromLocalFile(file.absoluteFilePath()));
-    m_recentFilesAction->saveEntries(m_config->group("RecentFiles"));
+    m_recentFilesAction->saveEntries(m_config->group(QStringLiteral("RecentFiles")));
     m_config->sync();
 }
 
@@ -429,8 +383,19 @@ void MainWindow::saveAs()
                                                  tr("PerfParser (*.perfparser)"));
     if (!url.isValid())
         return;
+    saveAs(url);
+}
+
+void MainWindow::saveAs(const QUrl& url)
+{
     m_exportAction->setEnabled(false);
     m_parser->exportResults(url);
+}
+
+void MainWindow::saveAs(const QString& path, const QUrl& url)
+{
+    m_exportAction->setEnabled(false);
+    m_parser->exportResults(path, url);
 }
 
 void MainWindow::aboutKDAB()
@@ -455,10 +420,10 @@ void MainWindow::aboutKDAB()
 
 void MainWindow::openSettingsDialog()
 {
-    m_settingsDialog->setWindowTitle(tr("Paths and Architecture Settings"));
+    m_settingsDialog->setWindowTitle(tr("Hotspot configuration"));
     m_settingsDialog->setWindowIcon(windowIcon());
     m_settingsDialog->adjustSize();
-    m_settingsDialog->initSettings(m_lastUsedSettings);
+    m_settingsDialog->initSettings();
     m_settingsDialog->open();
 }
 
@@ -466,7 +431,8 @@ void MainWindow::aboutHotspot()
 {
     AboutDialog dialog(this);
     dialog.setWindowTitle(tr("About Hotspot"));
-    dialog.setTitle(tr("Hotspot - the Linux perf GUI for performance analysis"));
+    dialog.setTitle(
+        tr("Hotspot %1 - the Linux perf GUI for performance analysis").arg(QCoreApplication::applicationVersion()));
     dialog.setText(tr("<qt><p>Hotspot is supported and maintained by KDAB</p>"
                       "<p>This project is a KDAB R&D effort to create a standalone GUI for performance data. "
                       "As the first goal, we want to provide a UI like KCachegrind around Linux perf. "
@@ -487,13 +453,13 @@ void MainWindow::aboutHotspot()
 void MainWindow::setupCodeNavigationMenu()
 {
     // Code Navigation
-    QAction* configAction =
+    auto* configAction =
         new QAction(QIcon::fromTheme(QStringLiteral("applications-development")), tr("Code Navigation"), this);
     auto menu = new QMenu(this);
     auto group = new QActionGroup(this);
     group->setExclusive(true);
 
-    const auto settings = m_config->group("CodeNavigation");
+    const auto settings = m_config->group(QStringLiteral("CodeNavigation"));
     const auto currentIdx = settings.readEntry("IDE", firstAvailableIde());
 
     for (int i = 0; i < ideSettingsSize; ++i) {
@@ -515,7 +481,7 @@ void MainWindow::setupCodeNavigationMenu()
     }
     menu->addSeparator();
 
-    QAction* action = new QAction(menu);
+    auto* action = new QAction(menu);
     action->setText(tr("Custom..."));
     action->setCheckable(true);
     action->setChecked(currentIdx == -1);
@@ -539,12 +505,13 @@ void MainWindow::setupCodeNavigationMenu()
     QObject::connect(group, &QActionGroup::triggered, this, &MainWindow::setCodeNavigationIDE);
 
     configAction->setMenu(menu);
-    ui->settingsMenu->addMenu(menu);
+    ui->settingsMenu->insertMenu(ui->settingsAction, menu);
+    ui->settingsMenu->insertSeparator(ui->settingsAction);
 }
 
 void MainWindow::setCodeNavigationIDE(QAction* action)
 {
-    auto settings = m_config->group("CodeNavigation");
+    auto settings = m_config->group(QStringLiteral("CodeNavigation"));
 
     if (action->data() == -1) {
         const auto customCmd =
@@ -565,15 +532,17 @@ void MainWindow::setCodeNavigationIDE(QAction* action)
 
 void MainWindow::navigateToCode(const QString& filePath, int lineNumber, int columnNumber)
 {
-    const auto settings = m_config->group("CodeNavigation");
+    const auto settings = m_config->group(QStringLiteral("CodeNavigation"));
     const auto ideIdx = settings.readEntry("IDE", firstAvailableIde());
 
     QString command;
+    QString desktopEntryName;
 #if !defined(Q_OS_WIN)                                                                                                 \
     && !defined(Q_OS_OSX) // Remove this #if branch when adding real data to ideSettings for Windows/OSX.
     if (ideIdx >= 0 && ideIdx < ideSettingsSize) {
         command =
             QString::fromUtf8(ideSettings[ideIdx].app) + QLatin1Char(' ') + QString::fromUtf8(ideSettings[ideIdx].args);
+        desktopEntryName = QString::fromUtf8(ideSettings[ideIdx].desktopEntryName);
     } else
 #endif
         if (ideIdx == -1) {
@@ -594,11 +563,42 @@ void MainWindow::navigateToCode(const QString& filePath, int lineNumber, int col
             arg.replace(QLatin1String("%c"), QString::number(std::max(1, columnNumber)));
         }
 
+#if KIO_VERSION >= QT_VERSION_CHECK(5, 69, 0)
+        auto* job = new KIO::CommandLauncherJob(command, args);
+        job->setDesktopName(desktopEntryName);
+
+        connect(job, &KJob::finished, this, [this, command, args](KJob* job) {
+            if (job->error()) {
+                m_resultsPage->showError(
+                    tr("Failed to launch command: %1 %2").arg(command, args.join(QLatin1Char(' '))));
+            }
+        });
+
+        job->start();
+#else
         if (!QProcess::startDetached(command, args)) {
             m_resultsPage->showError(tr("Failed to launch command: %1 %2").arg(command, args.join(QLatin1Char(' '))));
         }
+#endif
     } else {
         QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
         return;
     }
+}
+
+void MainWindow::openInNewWindow(const QString& file, const QStringList& args)
+{
+    auto process = new QProcess(qApp);
+    QObject::connect(process, &QProcess::errorOccurred, qApp, [=]() { qWarning() << file << process->errorString(); });
+    // the event loop locker prevents the main app from quitting while the child processes are still running
+    // we want to keep them all alive and quit them in one go. detaching isn't as nice, as we would not be
+    // able to quit all apps in one go via Ctrl+C then anymore'
+    QObject::connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), qApp,
+                     [process, lock = std::make_unique<QEventLoopLocker>()]() mutable {
+                         lock.reset();
+                         process->deleteLater();
+                     });
+    auto allArgs = args;
+    allArgs.append(file);
+    process->start(QCoreApplication::applicationFilePath(), allArgs);
 }
